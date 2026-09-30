@@ -7,6 +7,7 @@ use nucleo::{
     pattern::{CaseMatching, Normalization, Pattern},
     Config, Matcher, Utf32Str,
 };
+use std::time::Instant;
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -63,6 +64,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     let mut query = String::new();
     let mut cursor: usize = 0;
     let mut offset: usize = 0;
+    let mut last_wheel: Option<Instant> = None;
+    let mut wheel_step: usize = 1;
 
     loop {
         let order = rank(entries, &query);
@@ -198,20 +201,32 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             Event::Mouse(m) => {
                 let max_cur = order.len().saturating_sub(1);
                 match m.kind {
-                    MouseEventKind::ScrollUp => cursor = cursor.saturating_sub(3),
-                    MouseEventKind::ScrollDown => {
-                        cursor = (cursor + 3).min(max_cur);
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        // Natural wheel: 1 by 1, accelerates while spinning fast.
+                        let now = Instant::now();
+                        if last_wheel.is_some_and(|t| now - t < std::time::Duration::from_millis(150)) {
+                            wheel_step = (wheel_step + 1).min(8);
+                        } else {
+                            wheel_step = 1;
+                        }
+                        last_wheel = Some(now);
+                        if m.kind == MouseEventKind::ScrollUp {
+                            cursor = cursor.saturating_sub(wheel_step);
+                        } else {
+                            cursor = (cursor + wheel_step).min(max_cur);
+                        }
                     }
                     MouseEventKind::Down(MouseButton::Left)
                     | MouseEventKind::Drag(MouseButton::Left) => {
                         let row = m.row as usize;
-                        if row >= list_y && row < list_y + view_h && !order.is_empty() {
-                            if m.column as usize == scroll_x {
-                                // Scrollbar jump (proportional).
-                                cursor = ((row - list_y) * order.len() / view_h).min(max_cur);
-                            } else {
-                                cursor = (offset + row - list_y).min(max_cur);
-                            }
+                        if order.is_empty() {
+                        } else if m.column as usize == scroll_x {
+                            // Scrollbar: clamped, so dragging past the end
+                            // jumps to the end (and vice versa).
+                            let r = row.clamp(list_y, list_y + view_h - 1);
+                            cursor = ((r - list_y) * order.len() / view_h).min(max_cur);
+                        } else if row >= list_y && row < list_y + view_h {
+                            cursor = (offset + row - list_y).min(max_cur);
                         }
                     }
                     _ => {}
