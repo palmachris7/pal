@@ -7,7 +7,10 @@ use nucleo::{
     pattern::{CaseMatching, Normalization, Pattern},
     Config, Matcher, Utf32Str,
 };
-use std::time::Instant;
+use std::io::{BufRead, BufReader};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -54,6 +57,75 @@ pub fn display(entry: &str) -> String {
     entry.split('|').nth(1).map(|s| s.trim().to_string()).unwrap_or_else(|| entry.to_string())
 }
 
+/// `?pregunta` → (pi, pregunta), `??idea` → (opencode, idea). None = not a question.
+fn is_question(q: &str) -> Option<(&'static str, String)> {
+    let t = q.trim();
+    if let Some(r) = t.strip_prefix("??") {
+        let r = r.trim();
+        if r.is_empty() {
+            return None;
+        }
+        return Some(("opencode", r.to_string()));
+    }
+    if let Some(r) = t.strip_prefix('?') {
+        let r = r.trim();
+        if r.is_empty() {
+            return None;
+        }
+        return Some(("pi", r.to_string()));
+    }
+    None
+}
+
+enum AnsEvt {
+    Line(String),
+    Done,
+}
+
+fn kill_answer(child: &mut Option<Child>) {
+    if let Some(mut c) = child.take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+}
+
+fn reset_answer(
+    child: &mut Option<Child>,
+    active: &mut Option<u64>,
+    lines: &mut Vec<String>,
+    scroll: &mut usize,
+) {
+    kill_answer(child);
+    *active = None;
+    lines.clear();
+    *scroll = 0;
+}
+
+fn spawn_answer(agent: &str, prompt: &str, generation: u64, tx: std::sync::mpsc::Sender<(u64, AnsEvt)>) -> Option<Child> {
+    // PAL_PI_BIN / PAL_OCODE_BIN let users pin exact agent binaries.
+    let mut cmd = if agent == "pi" {
+        let mut c = Command::new(std::env::var("PAL_PI_BIN").unwrap_or("pi".into()));
+        c.args(["-p", prompt]);
+        c
+    } else {
+        let mut c = Command::new(std::env::var("PAL_OCODE_BIN").unwrap_or("opencode".into()));
+        c.args(["run", prompt]);
+        c
+    };
+    cmd.stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let out = child.stdout.take()?;
+    std::thread::spawn(move || {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            if tx.send((generation, AnsEvt::Line(line))).is_err() {
+                break;
+            }
+        }
+        let _ = tx.send((generation, AnsEvt::Done));
+    });
+    Some(child)
+}
+
 fn rank(entries: &[String], query: &str) -> Vec<usize> {
     if query.is_empty() {
         return (0..entries.len()).collect();
@@ -89,12 +161,57 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     let mut wheel_step: usize = 1;
     let mut drag_grab: Option<usize> = None;
     let mut pending: Option<Event> = None;
+    // Inline answer state (? / ?? questions).
+    let mut ans_lines: Vec<String> = vec![];
+    let mut ans_scroll: usize = 0;
+    let mut ans_gen: u64 = 0;
+    let mut ans_active: Option<u64> = None;
+    let mut ans_child: Option<Child> = None;
+    let mut ans_rx: Option<Receiver<(u64, AnsEvt)>> = None;
+    let mut ans_agent: &'static str = "pi";
+    let mut ans_last_q = String::new();
+    let mut last_type = Instant::now();
 
     loop {
         let order = rank(entries, &query);
         if cursor >= order.len() && !order.is_empty() {
             cursor = order.len() - 1;
         }
+        // Pump streamed answer lines (ignore stale generations).
+        if let Some(rx) = &ans_rx {
+            while let Ok((g, m)) = rx.try_recv() {
+                if Some(g) != ans_active {
+                    continue;
+                }
+                match m {
+                    AnsEvt::Line(l) => ans_lines.push(l),
+                    AnsEvt::Done => {
+                        ans_active = None;
+                        kill_answer(&mut ans_child);
+                    }
+                }
+            }
+        }
+        // Launch agent after 600ms idle on a real question.
+        // ans_last_q prevents relaunching after Done for the same text.
+        if let Some((agent, prompt)) = is_question(&query) {
+            ans_agent = agent;
+            if ans_active.is_none() && query != ans_last_q && last_type.elapsed() > Duration::from_millis(600) {
+                ans_gen += 1;
+                let (tx, rx) = mpsc::channel();
+                ans_rx = Some(rx);
+                ans_lines.clear();
+                ans_scroll = 0;
+                ans_active = Some(ans_gen);
+                ans_last_q = query.clone();
+                ans_child = spawn_answer(agent, &prompt, ans_gen, tx);
+                if ans_child.is_none() {
+                    ans_active = None;
+                    ans_lines.push("(no se pudo lanzar el agente)".into());
+                }
+            }
+        }
+        let answering = ans_active.is_some() || !ans_lines.is_empty();
         // Visible window follows the cursor (fzf viewport behavior).
         // Layout (fullscreen alt-screen, origin 0,0): border 0, inner x=1,
         // prompt y=1, separator y=2, header y=3, list y=4.., scrollbar x=w-2.
@@ -140,12 +257,28 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     .style(Style::default().fg(BORDER)),
                 rows[1],
             );
+            let header_txt = if answering {
+                if ans_active.is_some() {
+                    format!("   ✦ {} está respondiendo… (Enter abre sesión, Esc cierra)", ans_agent)
+                } else {
+                    format!("   ✦ respuesta de {} (Enter abre sesión, Esc cierra)", ans_agent)
+                }
+            } else {
+                "   Escribe para buscar o ejecutar (Enter = correr lo escrito)".into()
+            };
             f.render_widget(
-                Paragraph::new("   Escribe para buscar o ejecutar (Enter = correr lo escrito)")
+                Paragraph::new(header_txt)
                     .style(Style::default().fg(HEADER)),
                 rows[2],
             );
-            let items: Vec<ListItem> = order
+            let items: Vec<ListItem> = if answering {
+                ans_lines
+                    .iter()
+                    .skip(ans_scroll)
+                    .take(view_h)
+                    .map(|l| ListItem::new(Line::from(vec![Span::styled(format!("  {}", l), Style::default().fg(FG))])))
+                    .collect()
+            } else { order
                 .iter()
                 .enumerate()
                 .skip(offset)
@@ -167,14 +300,16 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                         Span::styled(format!("  {}", display(&entries[ei])), text_style),
                     ]))
                 })
-                .collect();
+                .collect()
+            };
             f.render_widget(List::new(items), rows[3]);
             // Scrollbar (fzf style): dim track + bright thumb on last column.
-            let total = order.len();
-            if total > view_h {
+            // In answer mode it follows ans_scroll over the answer lines.
+            let (sb_total, sb_off) = if answering { (ans_lines.len(), ans_scroll) } else { (order.len(), offset) };
+            if sb_total > view_h {
                 let list_area = rows[3];
                 let sx = list_area.right().saturating_sub(1);
-                let (start, th) = thumb(view_h, total, offset);
+                let (start, th) = thumb(view_h, sb_total, sb_off);
                 let buf = f.buffer_mut();
                 for i in 0..view_h {
                     let y = list_area.y + i as u16;
@@ -192,7 +327,18 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
         // draw() flushes the buffer: single write per frame (no tearing).
         // Cursor stays visible the whole time, parked at input (fzf style).
 
-        let Ok(first) = pending.take().map(Ok).unwrap_or_else(event::read) else { break };
+        // Poll (not block): lets streamed answer lines paint while idle.
+        let first = match pending.take() {
+            Some(e) => Some(e),
+            None => {
+                if event::poll(Duration::from_millis(150)).unwrap_or(false) {
+                    event::read().ok()
+                } else {
+                    None
+                }
+            }
+        };
+        let Some(first) = first else { continue };
         // Coalesce drag bursts: redraw once per burst, not per event.
         let mut ev = first;
         if matches!(ev, Event::Mouse(m) if matches!(m.kind, MouseEventKind::Drag(_))) {
@@ -211,9 +357,19 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
         }
         match ev {
             Event::Key(k) => match (k.code, k.modifiers) {
-            (KeyCode::Esc, _) => return None,
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => return None,
+            (KeyCode::Esc, _) => {
+                kill_answer(&mut ans_child);
+                return None;
+            }
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                kill_answer(&mut ans_child);
+                return None;
+            }
             (KeyCode::Enter, _) => {
+                kill_answer(&mut ans_child);
+                if answering {
+                    return Some((query, None));
+                }
                 let sel = order.get(cursor).map(|&i| entries[i].clone());
                 return Some((query, sel));
             }
@@ -221,12 +377,20 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 query.pop();
                 cursor = 0;
                 drag_grab = None;
+                reset_answer(&mut ans_child, &mut ans_active, &mut ans_lines, &mut ans_scroll);
+                last_type = Instant::now();
             }
             (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-                cursor = cursor.saturating_sub(1);
+                if answering {
+                    ans_scroll = ans_scroll.saturating_sub(1);
+                } else {
+                    cursor = cursor.saturating_sub(1);
+                }
             }
             (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
-                if cursor + 1 < order.len() {
+                if answering {
+                    ans_scroll = (ans_scroll + 1).min(ans_lines.len().saturating_sub(view_h));
+                } else if cursor + 1 < order.len() {
                     cursor += 1;
                 }
             }
@@ -234,6 +398,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 query.push(ch);
                 cursor = 0;
                 drag_grab = None;
+                reset_answer(&mut ans_child, &mut ans_active, &mut ans_lines, &mut ans_scroll);
+                last_type = Instant::now();
             }
             _ => {}
             },
@@ -250,7 +416,14 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                             wheel_step = 1;
                         }
                         last_wheel = Some(now);
-                        if m.kind == MouseEventKind::ScrollUp {
+                        if answering {
+                            if m.kind == MouseEventKind::ScrollUp {
+                                ans_scroll = ans_scroll.saturating_sub(wheel_step);
+                            } else {
+                                ans_scroll = (ans_scroll + wheel_step)
+                                    .min(ans_lines.len().saturating_sub(view_h));
+                            }
+                        } else if m.kind == MouseEventKind::ScrollUp {
                             cursor = cursor.saturating_sub(wheel_step);
                         } else {
                             cursor = (cursor + wheel_step).min(max_cur);
@@ -301,7 +474,6 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             _ => {}
         }
     }
-    None
 }
 
 struct AltGuard;
@@ -362,6 +534,18 @@ mod tests {
     #[test]
     fn display_shows_command_part() {
         assert_eq!(display("/x | msc → music"), "msc → music");
+    }
+
+    #[test]
+    fn question_detect() {
+        assert_eq!(is_question("?hola").unwrap().0, "pi");
+        assert_eq!(is_question("?hola").unwrap().1, "hola");
+        assert_eq!(is_question("??haz x").unwrap().0, "opencode");
+        assert!(is_question("?").is_none());
+        assert!(is_question("??").is_none());
+        assert!(is_question("?  ").is_none());
+        assert!(is_question("yazi").is_none());
+        assert!(is_question("msc --help").is_none());
     }
 
     #[test]
