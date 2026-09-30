@@ -2,7 +2,7 @@
 //! Same look (prompt ⚡, rounded border, nord-ish colors, reverse layout),
 //! same semantics: Enter runs selection (or typed query), Esc aborts.
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use nucleo::{
     pattern::{CaseMatching, Normalization, Pattern},
     Config, Matcher, Utf32Str,
@@ -56,6 +56,10 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
         Terminal::new(CrosstermBackend::new(std::io::BufWriter::new(io::stderr()))).ok()?;
     crossterm::terminal::enable_raw_mode().ok()?;
     let _alt = AltGuard::default();
+    {
+        use crossterm::ExecutableCommand;
+        let _ = io::stderr().execute(crossterm::event::EnableMouseCapture);
+    }
     let mut query = String::new();
     let mut cursor: usize = 0;
     let mut offset: usize = 0;
@@ -66,11 +70,14 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             cursor = order.len() - 1;
         }
         // Visible window follows the cursor (fzf viewport behavior).
-        let view_h = term
+        // Layout (fullscreen alt-screen, origin 0,0): border 0, inner x=1,
+        // prompt y=1, separator y=2, header y=3, list y=4.., scrollbar x=w-2.
+        let (term_w, view_h) = term
             .size()
-            .map(|s| (s.height as usize).saturating_sub(5))
-            .unwrap_or(20)
-            .max(1);
+            .map(|s| (s.width as usize, (s.height as usize).saturating_sub(5).max(1)))
+            .unwrap_or((100, 20));
+        let list_y: usize = 4;
+        let scroll_x: usize = term_w.saturating_sub(2);
         let max_off = order.len().saturating_sub(view_h);
         if offset > max_off {
             offset = max_off;
@@ -80,7 +87,6 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
         } else if cursor >= offset + view_h {
             offset = cursor + 1 - view_h;
         }
-        let _ = term.hide_cursor();
         let _ = term.draw(|f| {
             let area = f.area();
             let block = Block::default()
@@ -160,12 +166,11 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             f.set_cursor_position((rows[0].x + cell_w(&prompt_line), rows[0].y));
         });
         // draw() flushes the buffer: single write per frame (no tearing).
-        // Steady cursor back at input (hidden during paint above).
-        let _ = term.show_cursor();
+        // Cursor stays visible the whole time, parked at input (fzf style).
 
         let Ok(ev) = event::read() else { break };
-        let Event::Key(k) = ev else { continue };
-        match (k.code, k.modifiers) {
+        match ev {
+            Event::Key(k) => match (k.code, k.modifiers) {
             (KeyCode::Esc, _) => return None,
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return None,
             (KeyCode::Enter, _) => {
@@ -189,6 +194,30 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 cursor = 0;
             }
             _ => {}
+            },
+            Event::Mouse(m) => {
+                let max_cur = order.len().saturating_sub(1);
+                match m.kind {
+                    MouseEventKind::ScrollUp => cursor = cursor.saturating_sub(3),
+                    MouseEventKind::ScrollDown => {
+                        cursor = (cursor + 3).min(max_cur);
+                    }
+                    MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::Drag(MouseButton::Left) => {
+                        let row = m.row as usize;
+                        if row >= list_y && row < list_y + view_h && !order.is_empty() {
+                            if m.column as usize == scroll_x {
+                                // Scrollbar jump (proportional).
+                                cursor = ((row - list_y) * order.len() / view_h).min(max_cur);
+                            } else {
+                                cursor = (offset + row - list_y).min(max_cur);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
         }
     }
     None
@@ -210,6 +239,7 @@ impl Default for AltGuard {
 impl Drop for AltGuard {
     fn drop(&mut self) {
         use crossterm::ExecutableCommand;
+        let _ = io::stderr().execute(crossterm::event::DisableMouseCapture);
         let _ = crossterm::terminal::disable_raw_mode();
         let _ = io::stderr().execute(crossterm::terminal::LeaveAlternateScreen);
         let _ = io::stderr().execute(crossterm::cursor::Show);
