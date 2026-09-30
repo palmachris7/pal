@@ -28,6 +28,27 @@ fn cell_w(s: &str) -> u16 {
     s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
 }
 
+/// Thumb metrics (single source of truth, fzf getScrollbar style).
+/// Returns (start_row, len) within the visible window.
+fn thumb(view_h: usize, total: usize, offset: usize) -> (usize, usize) {
+    if total <= view_h {
+        return (0, view_h);
+    }
+    let len = (view_h * view_h / total).max(1);
+    let start = offset * (view_h - len) / (total - view_h).max(1);
+    (start, len)
+}
+
+/// Inverse mapping: window row (+grab) -> list offset.
+fn row_to_offset(r: usize, grab: usize, view_h: usize, th_len: usize, total: usize) -> usize {
+    let span = total.saturating_sub(view_h);
+    if span == 0 {
+        return 0;
+    }
+    let denom = (view_h - th_len).max(1);
+    (r.saturating_sub(grab) * span / denom).min(span)
+}
+
 /// Display part of an entry (fzf --with-nth=2 equivalent).
 pub fn display(entry: &str) -> String {
     entry.split('|').nth(1).map(|s| s.trim().to_string()).unwrap_or_else(|| entry.to_string())
@@ -66,6 +87,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     let mut offset: usize = 0;
     let mut last_wheel: Option<Instant> = None;
     let mut wheel_step: usize = 1;
+    let mut drag_grab: Option<usize> = None;
+    let mut pending: Option<Event> = None;
 
     loop {
         let order = rank(entries, &query);
@@ -126,8 +149,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 .iter()
                 .enumerate()
                 .skip(offset)
-                .take(view_h)
-                .map(|(vi, &ei)| {
+                .take(view_h)                .map(|(vi, &ei)| {
                     let selected = vi == cursor;
                     let mark_style = if selected {
                         Style::default().fg(MARK).bg(Color::Black).add_modifier(Modifier::BOLD)
@@ -152,18 +174,17 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             if total > view_h {
                 let list_area = rows[3];
                 let sx = list_area.right().saturating_sub(1);
-                let th = (view_h * view_h / total).max(1);
-                let start = offset * (view_h - th) / (total - view_h).max(1);
+                let (start, th) = thumb(view_h, total, offset);
                 let buf = f.buffer_mut();
                 for i in 0..view_h {
                     let y = list_area.y + i as u16;
                     if y >= list_area.bottom() {
                         break;
                     }
-                    let thumb = i >= start && i < start + th;
+                    let is_thumb = i >= start && i < start + th;
                     buf[(sx, y)]
                         .set_symbol("│")
-                        .set_fg(if thumb { Color::White } else { BORDER });
+                        .set_fg(if is_thumb { Color::White } else { BORDER });
                 }
             }
             f.set_cursor_position((rows[0].x + cell_w(&prompt_line), rows[0].y));
@@ -171,7 +192,23 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
         // draw() flushes the buffer: single write per frame (no tearing).
         // Cursor stays visible the whole time, parked at input (fzf style).
 
-        let Ok(ev) = event::read() else { break };
+        let Ok(first) = pending.take().map(Ok).unwrap_or_else(event::read) else { break };
+        // Coalesce drag bursts: redraw once per burst, not per event.
+        let mut ev = first;
+        if matches!(ev, Event::Mouse(m) if matches!(m.kind, MouseEventKind::Drag(_))) {
+            while event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+                match event::read() {
+                    Ok(Event::Mouse(nm)) if matches!(nm.kind, MouseEventKind::Drag(_)) => {
+                        ev = Event::Mouse(nm);
+                    }
+                    Ok(other) => {
+                        pending = Some(other);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
         match ev {
             Event::Key(k) => match (k.code, k.modifiers) {
             (KeyCode::Esc, _) => return None,
@@ -183,6 +220,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             (KeyCode::Backspace, _) => {
                 query.pop();
                 cursor = 0;
+                drag_grab = None;
             }
             (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                 cursor = cursor.saturating_sub(1);
@@ -195,11 +233,13 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             (KeyCode::Char(ch), KeyModifiers::NONE) | (KeyCode::Char(ch), KeyModifiers::SHIFT) => {
                 query.push(ch);
                 cursor = 0;
+                drag_grab = None;
             }
             _ => {}
             },
             Event::Mouse(m) => {
                 let max_cur = order.len().saturating_sub(1);
+                let total = order.len();
                 match m.kind {
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                         // Natural wheel: 1 by 1, accelerates while spinning fast.
@@ -216,18 +256,44 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                             cursor = (cursor + wheel_step).min(max_cur);
                         }
                     }
-                    MouseEventKind::Down(MouseButton::Left)
-                    | MouseEventKind::Drag(MouseButton::Left) => {
+                    MouseEventKind::Down(MouseButton::Left) => {
                         let row = m.row as usize;
-                        if order.is_empty() {
-                        } else if m.column as usize == scroll_x {
-                            // Scrollbar: clamped, so dragging past the end
-                            // jumps to the end (and vice versa).
-                            let r = row.clamp(list_y, list_y + view_h - 1);
-                            cursor = ((r - list_y) * order.len() / view_h).min(max_cur);
-                        } else if row >= list_y && row < list_y + view_h {
+                        if total > view_h
+                            && m.column as usize == scroll_x
+                            && row >= list_y
+                            && row < list_y + view_h
+                        {
+                            let r = row - list_y;
+                            let (th_start, th_len) = thumb(view_h, total, offset);
+                            if r >= th_start && r < th_start + th_len {
+                                // Grabbed the thumb: no jump, follow the finger.
+                                drag_grab = Some(r - th_start);
+                            } else {
+                                // Clicked the track: jump, grab middle for smooth drag.
+                                let grab = th_len / 2;
+                                offset = row_to_offset(r, grab, view_h, th_len, total);
+                                cursor = cursor.clamp(offset, (offset + view_h - 1).min(max_cur));
+                                drag_grab = Some(grab);
+                            }
+                        } else if row >= list_y && row < list_y + view_h && !order.is_empty() {
                             cursor = (offset + row - list_y).min(max_cur);
+                            drag_grab = None;
                         }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if total <= view_h || order.is_empty() {
+                        } else if let Some(grab) = drag_grab {
+                            // Scrollbar drag: inverse mapping, clamped to ends.
+                            let r = (m.row as usize).clamp(list_y, list_y + view_h - 1) - list_y;
+                            let (_, th_len) = thumb(view_h, total, offset);
+                            offset = row_to_offset(r, grab.min(view_h), view_h, th_len, total);
+                            cursor = cursor.clamp(offset, (offset + view_h - 1).min(max_cur));
+                        } else if (m.row as usize) >= list_y && (m.row as usize) < list_y + view_h {
+                            cursor = (offset + (m.row as usize) - list_y).min(max_cur);
+                        }
+                    }
+                    MouseEventKind::Up(_) => {
+                        drag_grab = None;
                     }
                     _ => {}
                 }
@@ -296,5 +362,30 @@ mod tests {
     #[test]
     fn display_shows_command_part() {
         assert_eq!(display("/x | msc → music"), "msc → music");
+    }
+
+    #[test]
+    fn thumb_top_and_bottom() {
+        assert_eq!(thumb(22, 1688, 0), (0, 1));
+        let (s, l) = thumb(22, 1688, 1688 - 22);
+        assert_eq!((s + l), 22);
+    }
+
+    #[test]
+    fn thumb_no_scroll_when_fits() {
+        assert_eq!(thumb(30, 10, 0), (0, 30));
+        assert_eq!(row_to_offset(5, 0, 30, 30, 10), 0);
+    }
+
+    #[test]
+    fn row_mapping_roundtrips() {
+        // row->offset->thumb-start must land back within one thumb-step.
+        let (vh, total) = (22, 1688);
+        let step = (total - vh) / vh + 1;
+        for off in [0, 100, 800, 1666] {
+            let (ts, tl) = thumb(vh, total, off);
+            let back = row_to_offset(ts, 0, vh, tl, total);
+            assert!((back as isize - off as isize).abs() <= step as isize, "off={off} back={back}");
+        }
     }
 }
