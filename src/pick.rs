@@ -10,6 +10,7 @@ use nucleo::{
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Terminal,
 };
@@ -19,6 +20,12 @@ use std::io;
 const FG: Color = Color::Rgb(0x81, 0xa1, 0xc1);
 const PROMPT: Color = Color::Rgb(0x8f, 0xbc, 0xbb);
 const BORDER: Color = Color::Rgb(0x5e, 0x81, 0xac);
+const HEADER: Color = Color::Indexed(109);
+const MARK: Color = Color::Indexed(161);
+
+fn cell_w(s: &str) -> u16 {
+    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+}
 
 /// Display part of an entry (fzf --with-nth=2 equivalent).
 pub fn display(entry: &str) -> String {
@@ -66,30 +73,53 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             f.render_widget(block, area);
             let rows = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                ])
                 .split(inner);
+            let prompt_line = format!("   ⚡ {}", query);
             f.render_widget(
-                Paragraph::new(format!("  ⚡ {}", query)).style(Style::default().fg(PROMPT)),
+                Paragraph::new(prompt_line.clone()).style(Style::default().fg(PROMPT).add_modifier(Modifier::BOLD)),
                 rows[0],
             );
             f.render_widget(
-                Paragraph::new("Escribe para buscar o ejecutar (Enter = correr lo escrito)")
-                    .style(Style::default().fg(FG)),
+                Paragraph::new("─".repeat(rows[1].width as usize))
+                    .style(Style::default().fg(BORDER)),
                 rows[1],
+            );
+            f.render_widget(
+                Paragraph::new("   Escribe para buscar o ejecutar (Enter = correr lo escrito)")
+                    .style(Style::default().fg(HEADER)),
+                rows[2],
             );
             let items: Vec<ListItem> = order
                 .iter()
                 .enumerate()
-                .take(rows[2].height as usize)
+                .take(rows[3].height as usize)
                 .map(|(vi, &ei)| {
-                    let mut st = Style::default().fg(FG);
-                    if vi == cursor {
-                        st = Style::default().fg(Color::White).bg(Color::Black).add_modifier(Modifier::BOLD);
-                    }
-                    ListItem::new(display(&entries[ei])).style(st)
+                    let selected = vi == cursor;
+                    let mark_style = if selected {
+                        Style::default().fg(MARK).bg(Color::Black).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Black)
+                    };
+                    let text_style = if selected {
+                        Style::default().fg(Color::White).bg(Color::Black).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(FG)
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::raw(" "),
+                        Span::styled("▌", mark_style),
+                        Span::styled(format!("  {}", display(&entries[ei])), text_style),
+                    ]))
                 })
                 .collect();
-            f.render_widget(List::new(items), rows[2]);
+            f.render_widget(List::new(items), rows[3]);
+            f.set_cursor_position((rows[0].x + cell_w(&prompt_line), rows[0].y));
         });
 
         let Ok(ev) = event::read() else { break };
