@@ -7,6 +7,7 @@
 
 mod apps;
 mod herdr;
+mod pick;
 
 use std::env;
 use std::fs;
@@ -19,6 +20,42 @@ fn config_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(env::var("HOME").unwrap_or_default()).join(".config"));
     base.join("pal_smart")
+}
+
+/// Legacy fzf subprocess path (escape hatch PAL_USE_FZF=1).
+fn fzf_run(fzf: &str, entries: &[String]) -> (String, String) {
+    let input = entries.join("\n");
+    let mut child = match Command::new(fzf)
+        .args([
+            "--height=100%",
+            "--layout=reverse",
+            "--border=rounded",
+            "--info=hidden",
+            "--prompt=  ⚡ ",
+            "--header=Escribe para buscar o ejecutar (Enter = correr lo escrito)",
+            "--scheme=history",
+            "--print-query",
+            "--delimiter=|",
+            "--with-nth=2",
+            "--color=fg:#81a1c1,bg:-1,hl:#88c0d0,fg+:white,bg+:black,hl+:white,prompt:#8fbcbb,border:#5e81ac",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => std::process::exit(0),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input.as_bytes());
+    }
+    let out = child.wait_with_output().map(|o| o.stdout).unwrap_or_default();
+    let text = String::from_utf8_lossy(&out);
+    let mut lines = text.lines();
+    (
+        lines.next().unwrap_or("").trim().to_string(),
+        lines.next().unwrap_or("").trim().to_string(),
+    )
 }
 
 fn main() {
@@ -64,36 +101,17 @@ fn main() {
         std::process::exit(127);
     }
 
-    let input = entries.join("\n");
-    let mut child = match Command::new(&fzf)
-        .args([
-            "--height=100%",
-            "--layout=reverse",
-            "--border=rounded",
-            "--info=hidden",
-            "--prompt=  ⚡ ",
-            "--header=Escribe para buscar o ejecutar (Enter = correr lo escrito)",
-            "--scheme=history",
-            "--print-query",
-            "--delimiter=|",
-            "--with-nth=2",
-            "--color=fg:#81a1c1,bg:-1,hl:#88c0d0,fg+:white,bg+:black,hl+:white,prompt:#8fbcbb,border:#5e81ac",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => std::process::exit(0),
+    // Native picker (nucleo+Ratatui) unless PAL_USE_FZF=1 escape hatch.
+    let (query, sel): (String, String) = if env::var("PAL_USE_FZF").as_deref() == Ok("1") {
+        fzf_run(&fzf, &entries)
+    } else {
+        match pick::run(&entries) {
+            Some((q, s)) => (q, s.unwrap_or_default()),
+            None => return, // Esc: silent exit like fzf
+        }
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(input.as_bytes());
-    }
-    let out = child.wait_with_output().map(|o| o.stdout).unwrap_or_default();
-    let text = String::from_utf8_lossy(&out);
-    let mut lines = text.lines();
-    let query = lines.next().unwrap_or("").trim().to_string();
-    let sel = lines.next().unwrap_or("").trim().to_string();
+    let query = query.trim().to_string();
+    let sel = sel.trim().to_string();
 
     // sel format: "<tag>| <cmd> → <desc>" — same parse as zsh.
     let mut cmd = if !sel.is_empty() {
