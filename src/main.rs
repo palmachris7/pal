@@ -124,44 +124,21 @@ fn main() {
     if cmd.is_empty() {
         return;
     }
+    // Questions (? / ??) are answered inline by the picker (copy+dismiss).
+    // They never open a pane: opencode stays headless here.
+    if cmd.starts_with('?') {
+        return;
+    }
 
     apps::bump_history(&dir, &cmd);
-
-    // AI dispatch (? → pi, ?? → opencode). History keeps the short
-    // "?..." text; Herdr gets the expanded agent invocation.
-    let open = ai_dispatch(&cmd).unwrap_or(cmd);
 
     // Detached open (new session → survives popup close), like the zsh.
     let ws = env::var("PAL_TARGET_WS").unwrap_or_default();
     let pane = env::var("PAL_ACTIVE_PANE").unwrap_or_default();
     let tab = env::var("PAL_TAB_ID").unwrap_or_default();
     let mode = env::var("PAL_SMART_OPEN").unwrap_or("auto".into());
-    herdr::spawn_detached_open(&open, &ws, &pane, &tab, &mode, &herdr_bin);
+    herdr::spawn_detached_open(&cmd, &ws, &pane, &tab, &mode, &herdr_bin);
     herdr::popup_close();
-}
-
-/// `?pregunta` / `??idea` → ask opencode. None = normal command.
-// TODO: multi-agent config; por ahora todo es opencode.
-fn ai_dispatch(cmd: &str) -> Option<String> {
-    if let Some(rest) = cmd.strip_prefix("??") {
-        let r = rest.trim();
-        if r.is_empty() {
-            return Some("opencode".into());
-        }
-        return Some(format!("opencode \"{}\"", shell_quote(r)));
-    }
-    if let Some(rest) = cmd.strip_prefix('?') {
-        let r = rest.trim();
-        if r.is_empty() {
-            return Some("opencode".into());
-        }
-        return Some(format!("opencode \"{}\"", shell_quote(r)));
-    }
-    None
-}
-
-fn shell_quote(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn which(name: &str) -> Option<String> {
@@ -191,33 +168,6 @@ fn which(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn ai_q_dispatch() {
-        assert_eq!(ai_dispatch("?hola mundo"), Some("opencode \"hola mundo\"".into()));
-        assert_eq!(ai_dispatch("?"), Some("opencode".into()));
-        assert_eq!(ai_dispatch("?  "), Some("opencode".into()));
-    }
-
-    #[test]
-    fn ai_opencode_dispatch() {
-        assert_eq!(ai_dispatch("??haz esto"), Some("opencode \"haz esto\"".into()));
-        assert_eq!(ai_dispatch("??"), Some("opencode".into()));
-    }
-
-    #[test]
-    fn ai_no_dispatch_normal() {
-        assert_eq!(ai_dispatch("yazi"), None);
-        assert_eq!(ai_dispatch("pi"), None);
-        assert_eq!(ai_dispatch("msc --help"), None);
-    }
-
-    #[test]
-    fn ai_quote_escapes() {
-        assert_eq!(
-            ai_dispatch("?di \"hola\" ya"),
-            Some("opencode \"di \\\"hola\\\" ya\"".into())
-        );
-    }
+    // Question dismissal (no pane) is structural: cmd starting with '?'
+    // returns before spawn_detached_open. Covered by picker tests.
 }

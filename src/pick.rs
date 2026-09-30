@@ -83,6 +83,64 @@ enum AnsEvt {
     Done,
 }
 
+/// Parsed bits of one `opencode run --format json` JSONL event.
+struct Parsed {
+    session: Option<String>,
+    texts: Vec<String>,
+    error: Option<String>,
+}
+
+fn str_at(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
+}
+
+/// Tolerant parse: complete text blocks only (no deltas), skip tool/reasoning noise.
+fn parse_json_line(line: &str) -> Parsed {
+    let mut out = Parsed { session: None, texts: vec![], error: None };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return out };
+    if let Some(s) = str_at(&v, "sessionID") {
+        if s.starts_with("ses_") {
+            out.session = Some(s);
+        }
+    }
+    let t = str_at(&v, "type").unwrap_or_default();
+    match t.as_str() {
+        "text" => {
+            // Try known shapes: {text}, {part:{text}}, {properties:{part:{text}}}, {delta}.
+            let mut found: Option<String> = str_at(&v, "text")
+                .or_else(|| str_at(&v, "delta"))
+                .or_else(|| v.get("part").and_then(|p| str_at(p, "text")))
+                .or_else(|| {
+                    v.get("properties")
+                        .and_then(|p| p.get("part"))
+                        .and_then(|p| str_at(p, "text"))
+                });
+            if found.is_none() {
+                // Last resort: {data:{text}} / {message:{text}}.
+                found = v
+                    .get("data")
+                    .and_then(|d| str_at(d, "text"))
+                    .or_else(|| v.get("message").and_then(|m| str_at(m, "text")));
+            }
+            if let Some(text) = found {
+                if !text.trim().is_empty() {
+                    out.texts.push(text);
+                }
+            }
+        }
+        "error" => {
+            let msg = v
+                .get("error")
+                .and_then(|e| str_at(e, "message").or_else(|| str_at(e, "text")))
+                .or_else(|| str_at(&v, "message"))
+                .unwrap_or_else(|| "error desconocido".into());
+            out.error = Some(msg);
+        }
+        _ => {}
+    }
+    out
+}
+
 fn kill_answer(child: &mut Option<Child>) {
     if let Some(mut c) = child.take() {
         let _ = c.kill();
@@ -117,11 +175,23 @@ fn reset_answer(
     *scroll = 0;
 }
 
-fn spawn_answer(agent: &str, prompt: &str, generation: u64, tx: std::sync::mpsc::Sender<(u64, AnsEvt)>) -> Option<Child> {
+fn spawn_answer(
+    agent: &str,
+    prompt: &str,
+    generation: u64,
+    session: Option<String>,
+    tx: std::sync::mpsc::Sender<(u64, AnsEvt)>,
+) -> Option<Child> {
     // PAL_OCODE_BIN lets users pin the exact agent binary. Todo opencode por ahora.
     let _ = agent;
     let mut cmd = Command::new(std::env::var("PAL_OCODE_BIN").unwrap_or("opencode".into()));
-    cmd.args(["run", prompt]);
+    // Headless JSONL: one JSON object per line (step_start/text/tool_use/...).
+    // --session continues the conversation within this pal run.
+    if let Some(s) = session {
+        cmd.args(["run", "-s", &s, "--format", "json", prompt]);
+    } else {
+        cmd.args(["run", "--format", "json", prompt]);
+    }
     cmd.stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
     let mut child = cmd.spawn().ok()?;
     let out = child.stdout.take()?;
@@ -178,8 +248,9 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     let mut ans_active: Option<u64> = None;
     let mut ans_child: Option<Child> = None;
     let mut ans_rx: Option<Receiver<(u64, AnsEvt)>> = None;
-    let mut ans_agent: &'static str = "pi";
+    let mut ans_agent: &'static str = "opencode";
     let mut ans_last_q = String::new();
+    let mut ans_session: Option<String> = None;
     let mut last_type = Instant::now();
 
     loop {
@@ -187,14 +258,29 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
         if cursor >= order.len() && !order.is_empty() {
             cursor = order.len() - 1;
         }
-        // Pump streamed answer lines (ignore stale generations).
+        // Pump streamed answer events (ignore stale generations).
         if let Some(rx) = &ans_rx {
             while let Ok((g, m)) = rx.try_recv() {
                 if Some(g) != ans_active {
                     continue;
                 }
                 match m {
-                    AnsEvt::Line(l) => ans_lines.push(l),
+                    AnsEvt::Line(l) => {
+                        let p = parse_json_line(&l);
+                        if let Some(s) = p.session {
+                            ans_session = Some(s);
+                        }
+                        if let Some(e) = p.error {
+                            ans_lines.push(format!("⚠ {}", e.lines().next().unwrap_or("error")));
+                        }
+                        for t in p.texts {
+                            // Skip exact-duplicate consecutive blocks (re-emitted parts).
+                            let dup = ans_lines.last().is_some_and(|last| last == &t);
+                            if !dup {
+                                ans_lines.extend(t.lines().map(|s| s.to_string()));
+                            }
+                        }
+                    }
                     AnsEvt::Done => {
                         ans_active = None;
                         kill_answer(&mut ans_child);
@@ -214,7 +300,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 ans_scroll = 0;
                 ans_active = Some(ans_gen);
                 ans_last_q = query.clone();
-                ans_child = spawn_answer(agent, &prompt, ans_gen, tx);
+                ans_child = spawn_answer(agent, &prompt, ans_gen, ans_session.clone(), tx);
                 if ans_child.is_none() {
                     ans_active = None;
                     ans_lines.push("(no se pudo lanzar el agente)".into());
@@ -558,6 +644,30 @@ mod tests {
         assert!(is_question("?  ").is_none());
         assert!(is_question("yazi").is_none());
         assert!(is_question("msc --help").is_none());
+    }
+
+    #[test]
+    fn json_text_shapes() {
+        let p = parse_json_line(r#"{"type":"text","text":"hola","sessionID":"ses_1","timestamp":1}"#);
+        assert_eq!(p.texts, vec!["hola"]);
+        assert_eq!(p.session.as_deref(), Some("ses_1"));
+        let p = parse_json_line(r#"{"type":"text","part":{"text":"mundo"},"sessionID":"ses_2"}"#);
+        assert_eq!(p.texts, vec!["mundo"]);
+        let p = parse_json_line(r#"{"type":"text","properties":{"part":{"text":"x"}}}"#);
+        assert_eq!(p.texts, vec!["x"]);
+        // Noise types yield nothing.
+        let p = parse_json_line(r#"{"type":"tool_use","sessionID":"ses_1"}"#);
+        assert!(p.texts.is_empty() && p.error.is_none());
+        assert_eq!(p.session.as_deref(), Some("ses_1"));
+        let p = parse_json_line(r#"{"type":"reasoning","text":"pensando"}"#);
+        assert!(p.texts.is_empty());
+        let p = parse_json_line(r#"{"type":"step_start","sessionID":"ses_9"}"#);
+        assert_eq!(p.session.as_deref(), Some("ses_9"));
+        let p = parse_json_line(r#"{"type":"error","error":{"message":"boom"}}"#);
+        assert_eq!(p.error.as_deref(), Some("boom"));
+        // Garbage never panics, never shows noise.
+        let p = parse_json_line("esto no es json");
+        assert!(p.texts.is_empty() && p.session.is_none() && p.error.is_none());
     }
 
     #[test]
