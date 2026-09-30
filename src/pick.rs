@@ -57,7 +57,8 @@ pub fn display(entry: &str) -> String {
     entry.split('|').nth(1).map(|s| s.trim().to_string()).unwrap_or_else(|| entry.to_string())
 }
 
-/// `?pregunta` → (pi, pregunta), `??idea` → (opencode, idea). None = not a question.
+/// `?pregunta` / `??idea` → (opencode, texto). None = not a question.
+// TODO: multi-agent config; por ahora todo es opencode.
 fn is_question(q: &str) -> Option<(&'static str, String)> {
     let t = q.trim();
     if let Some(r) = t.strip_prefix("??") {
@@ -72,7 +73,7 @@ fn is_question(q: &str) -> Option<(&'static str, String)> {
         if r.is_empty() {
             return None;
         }
-        return Some(("pi", r.to_string()));
+        return Some(("opencode", r.to_string()));
     }
     None
 }
@@ -85,6 +86,21 @@ enum AnsEvt {
 fn kill_answer(child: &mut Option<Child>) {
     if let Some(mut c) = child.take() {
         let _ = c.kill();
+        let _ = c.wait();
+    }
+}
+
+/// Enter on an answer: copy it to clipboard, dismiss with no pane.
+fn copy_answer(lines: &[String]) {
+    use std::io::Write as _;
+    if lines.is_empty() {
+        return;
+    }
+    if let Ok(mut c) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+        if let Some(mut stdin) = c.stdin.take() {
+            let _ = stdin.write_all(lines.join("\n").as_bytes());
+        }
+        // Wait for it: an orphaned pbcopy gets SIGHUP'd and drops the text.
         let _ = c.wait();
     }
 }
@@ -102,16 +118,10 @@ fn reset_answer(
 }
 
 fn spawn_answer(agent: &str, prompt: &str, generation: u64, tx: std::sync::mpsc::Sender<(u64, AnsEvt)>) -> Option<Child> {
-    // PAL_PI_BIN / PAL_OCODE_BIN let users pin exact agent binaries.
-    let mut cmd = if agent == "pi" {
-        let mut c = Command::new(std::env::var("PAL_PI_BIN").unwrap_or("pi".into()));
-        c.args(["-p", prompt]);
-        c
-    } else {
-        let mut c = Command::new(std::env::var("PAL_OCODE_BIN").unwrap_or("opencode".into()));
-        c.args(["run", prompt]);
-        c
-    };
+    // PAL_OCODE_BIN lets users pin the exact agent binary. Todo opencode por ahora.
+    let _ = agent;
+    let mut cmd = Command::new(std::env::var("PAL_OCODE_BIN").unwrap_or("opencode".into()));
+    cmd.args(["run", prompt]);
     cmd.stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
     let mut child = cmd.spawn().ok()?;
     let out = child.stdout.take()?;
@@ -368,7 +378,9 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             (KeyCode::Enter, _) => {
                 kill_answer(&mut ans_child);
                 if answering {
-                    return Some((query, None));
+                    // Pregunta: copiar respuesta y salir sin abrir ventana.
+                    copy_answer(&ans_lines);
+                    return Some((String::new(), None));
                 }
                 let sel = order.get(cursor).map(|&i| entries[i].clone());
                 return Some((query, sel));
@@ -538,7 +550,7 @@ mod tests {
 
     #[test]
     fn question_detect() {
-        assert_eq!(is_question("?hola").unwrap().0, "pi");
+        assert_eq!(is_question("?hola").unwrap().0, "opencode");
         assert_eq!(is_question("?hola").unwrap().1, "hola");
         assert_eq!(is_question("??haz x").unwrap().0, "opencode");
         assert!(is_question("?").is_none());

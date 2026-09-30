@@ -140,7 +140,8 @@ fn main() {
     herdr::popup_close();
 }
 
-/// `?pregunta` → ask pi, `??idea` → ask opencode. None = normal command.
+/// `?pregunta` / `??idea` → ask opencode. None = normal command.
+// TODO: multi-agent config; por ahora todo es opencode.
 fn ai_dispatch(cmd: &str) -> Option<String> {
     if let Some(rest) = cmd.strip_prefix("??") {
         let r = rest.trim();
@@ -152,9 +153,9 @@ fn ai_dispatch(cmd: &str) -> Option<String> {
     if let Some(rest) = cmd.strip_prefix('?') {
         let r = rest.trim();
         if r.is_empty() {
-            return Some("pi".into());
+            return Some("opencode".into());
         }
-        return Some(format!("pi \"{}\"", shell_quote(r)));
+        return Some(format!("opencode \"{}\"", shell_quote(r)));
     }
     None
 }
@@ -193,10 +194,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ai_pi_dispatch() {
-        assert_eq!(ai_dispatch("?hola mundo"), Some("pi \"hola mundo\"".into()));
-        assert_eq!(ai_dispatch("?"), Some("pi".into()));
-        assert_eq!(ai_dispatch("?  "), Some("pi".into()));
+    fn ai_q_dispatch() {
+        assert_eq!(ai_dispatch("?hola mundo"), Some("opencode \"hola mundo\"".into()));
+        assert_eq!(ai_dispatch("?"), Some("opencode".into()));
+        assert_eq!(ai_dispatch("?  "), Some("opencode".into()));
     }
 
     #[test]
@@ -216,7 +217,7 @@ mod tests {
     fn ai_quote_escapes() {
         assert_eq!(
             ai_dispatch("?di \"hola\" ya"),
-            Some("pi \"di \\\"hola\\\" ya\"".into())
+            Some("opencode \"di \\\"hola\\\" ya\"".into())
         );
     }
 }
