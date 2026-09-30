@@ -137,17 +137,17 @@ fn frequent(dir: &Path) -> Vec<String> {
 }
 
 fn is_executable(p: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::metadata(p)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+    if !p.is_file() {
+        return false; // dirs (e.g. *.mlmodelc bundles) have search +x but aren't commands
     }
-    #[cfg(not(unix))]
-    {
-        p.is_file()
-    }
+    // access(X_OK) like shells do: real permission for THIS user,
+    // not just "any exec bit set" (e.g. root-only cupsd is excluded).
+    use std::ffi::CString;
+    let Ok(c) = CString::new(p.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    // SAFETY: c is a valid NUL-terminated path, access takes no ownership.
+    unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
 }
 
 /// Append to history, keep last 200 lines.
