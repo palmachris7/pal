@@ -355,9 +355,9 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             );
             let header_txt = if answering {
                 if ans_active.is_some() {
-                    format!("   ✦ {} está respondiendo… (Enter abre sesión, Esc cierra)", ans_agent)
+                    format!("   ✦ {} está respondiendo… (Enter copia y sale, Esc cierra)", ans_agent)
                 } else {
-                    format!("   ✦ respuesta de {} (Enter abre sesión, Esc cierra)", ans_agent)
+                    format!("   ✦ respuesta de {} (Enter copia y sale, Esc cierra)", ans_agent)
                 }
             } else {
                 "   Escribe para buscar o ejecutar (Enter = correr lo escrito)".into()
@@ -463,13 +463,22 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             }
             (KeyCode::Enter, _) => {
                 kill_answer(&mut ans_child);
-                if answering {
-                    // Pregunta: copiar respuesta y salir sin abrir ventana.
-                    copy_answer(&ans_lines);
-                    return Some((String::new(), None));
+                if is_question(&query).is_some() {
+                    if answering && !ans_lines.is_empty() {
+                        // Respuesta lista: copiar y salir sin ventana.
+                        copy_answer(&ans_lines);
+                        return Some((String::new(), None));
+                    }
+                    // Sin respuesta aún (Enter rápido): lanzar ya y quedarse.
+                    ans_active = None;
+                    ans_last_q = String::new();
+                    ans_lines.clear();
+                    ans_scroll = 0;
+                    last_type = Instant::now() - Duration::from_secs(3600);
+                } else {
+                    let sel = order.get(cursor).map(|&i| entries[i].clone());
+                    return Some((query, sel));
                 }
-                let sel = order.get(cursor).map(|&i| entries[i].clone());
-                return Some((query, sel));
             }
             (KeyCode::Backspace, _) => {
                 query.pop();
