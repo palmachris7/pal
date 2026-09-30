@@ -52,17 +52,35 @@ fn rank(entries: &[String], query: &str) -> Vec<usize> {
 
 /// Run the picker. Returns (query, selection?) or None on abort.
 pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
-    let mut term = Terminal::new(CrosstermBackend::new(io::stderr())).ok()?;
+    let mut term =
+        Terminal::new(CrosstermBackend::new(std::io::BufWriter::new(io::stderr()))).ok()?;
     crossterm::terminal::enable_raw_mode().ok()?;
     let _alt = AltGuard::default();
     let mut query = String::new();
     let mut cursor: usize = 0;
+    let mut offset: usize = 0;
 
     loop {
         let order = rank(entries, &query);
         if cursor >= order.len() && !order.is_empty() {
             cursor = order.len() - 1;
         }
+        // Visible window follows the cursor (fzf viewport behavior).
+        let view_h = term
+            .size()
+            .map(|s| (s.height as usize).saturating_sub(5))
+            .unwrap_or(20)
+            .max(1);
+        let max_off = order.len().saturating_sub(view_h);
+        if offset > max_off {
+            offset = max_off;
+        }
+        if cursor < offset {
+            offset = cursor;
+        } else if cursor >= offset + view_h {
+            offset = cursor + 1 - view_h;
+        }
+        let _ = term.hide_cursor();
         let _ = term.draw(|f| {
             let area = f.area();
             let block = Block::default()
@@ -82,7 +100,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 .split(inner);
             let prompt_line = format!("   ⚡ {}", query);
             f.render_widget(
-                Paragraph::new(prompt_line.clone()).style(Style::default().fg(PROMPT).add_modifier(Modifier::BOLD)),
+                Paragraph::new(prompt_line.as_str()).style(Style::default().fg(PROMPT).add_modifier(Modifier::BOLD)),
                 rows[0],
             );
             f.render_widget(
@@ -98,7 +116,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             let items: Vec<ListItem> = order
                 .iter()
                 .enumerate()
-                .take(rows[3].height as usize)
+                .skip(offset)
+                .take(view_h)
                 .map(|(vi, &ei)| {
                     let selected = vi == cursor;
                     let mark_style = if selected {
@@ -119,8 +138,30 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 })
                 .collect();
             f.render_widget(List::new(items), rows[3]);
+            // Scrollbar (fzf style): dim track + bright thumb on last column.
+            let total = order.len();
+            if total > view_h {
+                let list_area = rows[3];
+                let sx = list_area.right().saturating_sub(1);
+                let th = (view_h * view_h / total).max(1);
+                let start = offset * (view_h - th) / (total - view_h).max(1);
+                let buf = f.buffer_mut();
+                for i in 0..view_h {
+                    let y = list_area.y + i as u16;
+                    if y >= list_area.bottom() {
+                        break;
+                    }
+                    let thumb = i >= start && i < start + th;
+                    buf[(sx, y)]
+                        .set_symbol("│")
+                        .set_fg(if thumb { Color::White } else { BORDER });
+                }
+            }
             f.set_cursor_position((rows[0].x + cell_w(&prompt_line), rows[0].y));
         });
+        // draw() flushes the buffer: single write per frame (no tearing).
+        // Steady cursor back at input (hidden during paint above).
+        let _ = term.show_cursor();
 
         let Ok(ev) = event::read() else { break };
         let Event::Key(k) = ev else { continue };
@@ -171,6 +212,7 @@ impl Drop for AltGuard {
         use crossterm::ExecutableCommand;
         let _ = crossterm::terminal::disable_raw_mode();
         let _ = io::stderr().execute(crossterm::terminal::LeaveAlternateScreen);
+        let _ = io::stderr().execute(crossterm::cursor::Show);
     }
 }
 
