@@ -398,6 +398,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     let mut cursor: usize = 0;
     let mut offset: usize = 0;
     let mut drag_grab: Option<usize> = None;
+    // Double-click opens (fzf parity: double-click = Enter).
+    let mut last_click: Option<(usize, Instant)> = None;
     let mut pending: Option<Event> = None;
     let mut err_streak: usize = 0;
     let mut focused = true;
@@ -820,6 +822,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 drag_grab = None;
                 reset_answer(&mut ans_child, &mut ans_active, &mut ans_lines, &mut ans_scroll);
                 ans_pinned = true;
+                last_click = None;
                 last_type = Instant::now();
             }
             (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
@@ -845,6 +848,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 drag_grab = None;
                 reset_answer(&mut ans_child, &mut ans_active, &mut ans_lines, &mut ans_scroll);
                 ans_pinned = true;
+                last_click = None;
                 last_type = Instant::now();
             }
             _ => {}
@@ -913,7 +917,17 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                                 ans_scroll = set_ans_scroll(r * sb_total / view_h, view_h, sb_total);
                                 ans_pinned = ans_scroll == ans_lines.len().saturating_sub(view_h);
                             } else {
-                                cursor = (offset + row - list_y).min(max_cur);
+                                let target = (offset + row - list_y).min(max_cur);
+                                // Double-click opens (fzf parity): same row twice fast.
+                                let now = Instant::now();
+                                if last_click.is_some_and(|(t, at)| t == target && now - at < Duration::from_millis(500)) {
+                                    kill_answer(&mut ans_child);
+                                    let sel = order.get(target).map(|&i| entries[i].clone());
+                                    journal.line(format!("exit dblclick sel={}", sel.is_some() as u8));
+                                    return Some((query, sel));
+                                }
+                                cursor = target;
+                                last_click = Some((target, now));
                             }
                             drag_grab = None;
                         }
