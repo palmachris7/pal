@@ -30,7 +30,7 @@ const FG: Color = Color::Rgb(0x81, 0xa1, 0xc1);
 const PROMPT: Color = Color::Rgb(0x8f, 0xbc, 0xbb);
 const BORDER: Color = Color::Rgb(0x5e, 0x81, 0xac);
 const HEADER: Color = Color::Indexed(109);
-const MARK: Color = Color::Indexed(161);
+const MARK: Color = Color::Rgb(0xBF, 0x61, 0x6A); // nord11 aurora red
 const HL: Color = Color::Rgb(0x88, 0xc0, 0xd0);
 const CODE: Color = Color::Indexed(180);
 
