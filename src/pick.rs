@@ -457,9 +457,14 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
         if offset > max_off {
             offset = max_off;
         }
-        // NOTE: no cursor-follow snap here on purpose: the wheel roams the
-        // viewport freely while the selection stays (Gmail-style). Keyboard
-        // nav snaps the viewport in its own arms below.
+        // fzf parity: the selection never leaves the screen.
+        // The wheel moves the CURSOR (with acceleration); the viewport
+        // follows it here. Keyboard does the same in its own arms.
+        if cursor < offset {
+            offset = cursor;
+        } else if cursor >= offset + view_h {
+            offset = cursor + 1 - view_h;
+        }
         // Answer scroll: clamp every frame (resize-safe) + tail-follow.
         let ans_max = ans_lines.len().saturating_sub(view_h);
         if ans_scroll > ans_max {
@@ -661,7 +666,6 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             (KeyCode::Backspace, _) => {
                 query.pop();
                 cursor = 0;
-                offset = 0;
                 drag_grab = None;
                 reset_answer(&mut ans_child, &mut ans_active, &mut ans_lines, &mut ans_scroll);
                 ans_pinned = true;
@@ -673,9 +677,6 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     ans_pinned = false;
                 } else {
                     cursor = cursor.saturating_sub(1);
-                    if cursor < offset {
-                        offset = cursor;
-                    }
                 }
             }
             (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
@@ -683,19 +684,13 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     let max_s = ans_lines.len().saturating_sub(view_h);
                     ans_scroll = (ans_scroll + 1).min(max_s);
                     ans_pinned = ans_scroll == max_s;
-                } else {
-                    if cursor + 1 < order.len() {
-                        cursor += 1;
-                    }
-                    if cursor >= offset + view_h {
-                        offset = cursor + 1 - view_h;
-                    }
+                } else if cursor + 1 < order.len() {
+                    cursor += 1;
                 }
             }
             (KeyCode::Char(ch), KeyModifiers::NONE) | (KeyCode::Char(ch), KeyModifiers::SHIFT) => {
                 query.push(ch);
                 cursor = 0;
-                offset = 0;
                 drag_grab = None;
                 reset_answer(&mut ans_child, &mut ans_active, &mut ans_lines, &mut ans_scroll);
                 ans_pinned = true;
@@ -726,16 +721,9 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                             }
                             ans_pinned = ans_scroll == ans_lines.len().saturating_sub(view_h);
                         } else if m.kind == MouseEventKind::ScrollUp {
-                            // Wheel scrolls the VIEWPORT (selection stays put).
-                            offset = offset.saturating_sub(wheel_step);
-                            if !order.is_empty() && cursor < offset {
-                                cursor = offset;
-                            }
+                            cursor = cursor.saturating_sub(wheel_step);
                         } else {
-                            offset = (offset + wheel_step).min(max_off);
-                            if !order.is_empty() && cursor >= offset + view_h {
-                                cursor = (offset + view_h).saturating_sub(1).min(max_cur);
-                            }
+                            cursor = (cursor + wheel_step).min(max_cur);
                         }
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
