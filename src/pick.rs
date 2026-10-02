@@ -365,6 +365,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     let mut wheel_step: usize = 1;
     let mut drag_grab: Option<usize> = None;
     let mut pending: Option<Event> = None;
+    let mut err_streak: usize = 0;
     // Inline answer state (? / ?? questions).
     let mut ans_lines: Vec<String> = vec![];
     let mut ans_scroll: usize = 0;
@@ -607,12 +608,31 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
         // Cursor stays visible the whole time, parked at input (fzf style).
 
         // Poll (not block): lets streamed answer lines paint while idle.
+        // Error budget: a poisoned fd (unparsable bytes stuck in the reader)
+        // would deafen us forever; exit clean instead of freezing.
         let first = match pending.take() {
-            Some(e) => Some(e),
+            Some(e) => {
+                err_streak = 0;
+                Some(e)
+            }
             None => {
                 if event::poll(Duration::from_millis(150)).unwrap_or(false) {
-                    event::read().ok()
+                    match event::read() {
+                        Ok(e) => {
+                            err_streak = 0;
+                            Some(e)
+                        }
+                        Err(_) => {
+                            err_streak += 1;
+                            if err_streak > 200 {
+                                kill_answer(&mut ans_child);
+                                return None;
+                            }
+                            None
+                        }
+                    }
                 } else {
+                    err_streak = 0;
                     None
                 }
             }
