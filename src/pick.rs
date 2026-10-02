@@ -379,6 +379,9 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     let mut ans_pinned = true;
     let mut spin: usize = 0;
     let mut last_key: Option<(String, usize, usize, usize, usize, bool, usize, usize, usize)> = None;
+    // Single source of geometry truth: the LAST DRAWN layout.
+    // (list_y, list_h, scroll_x). Events map to pixels that exist.
+    let mut geo: (usize, usize, usize) = (4, 20, 98);
 
     loop {
         let pat = if query.is_empty() {
@@ -443,15 +446,11 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             }
         }
         let answering = ans_active.is_some() || !ans_lines.is_empty();
-        // Visible window follows the cursor (fzf viewport behavior).
-        // Layout (fullscreen alt-screen, origin 0,0): border 0, inner x=1,
-        // prompt y=1, separator y=2, header y=3, list y=4.., scrollbar x=w-2.
-        let (term_w, view_h) = term
-            .size()
-            .map(|s| (s.width as usize, (s.height as usize).saturating_sub(5).max(1)))
-            .unwrap_or((100, 20));
-        let list_y: usize = 4;
-        let scroll_x: usize = term_w.saturating_sub(2);
+        // Geometry comes from the last drawn frame (never recomputed from
+        // term.size here): clicks and follow map to pixels that exist.
+        let list_y = geo.0;
+        let view_h = geo.1.max(1);
+        let scroll_x = geo.2;
         let max_off = order.len().saturating_sub(view_h);
         if offset > max_off {
             offset = max_off;
@@ -476,6 +475,11 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             spin += 1;
         }
         // Frame pacing: skip identical frames (rhythm without storms).
+        // term size only joins the key (resize detection), never the logic.
+        let (kw, kh) = term
+            .size()
+            .map(|s| (s.width as usize, s.height as usize))
+            .unwrap_or((100, 25));
         let key = (
             query.clone(),
             cursor,
@@ -484,11 +488,12 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             ans_lines.len(),
             ans_active.is_some(),
             spin,
-            term_w,
-            view_h,
+            kw,
+            kh,
         );
         if last_key.as_ref() != Some(&key) {
             last_key = Some(key);
+            let mut drawn_geo = (list_y, view_h, scroll_x);
             let _ = term.draw(|f| {
             let area = f.area();
             let block = Block::default()
@@ -531,19 +536,26 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 rows[2],
             );
             // Content width: indent + 1 column reserved for scrollbar.
+            // drawn_h is the REAL list height (layout truth, not term.size).
+            let drawn_h = (rows[3].height as usize).max(1);
+            drawn_geo = (
+                rows[3].y as usize,
+                drawn_h,
+                rows[3].right().saturating_sub(1) as usize,
+            );
             let content_w = (rows[3].width as usize).saturating_sub(1);
             let items: Vec<ListItem> = if answering {
                 ans_lines
                     .iter()
                     .skip(ans_scroll)
-                    .take(view_h)
+                    .take(drawn_h)
                     .map(|l| ListItem::new(Line::from(md_spans(&fit(l, content_w.saturating_sub(2)), Style::default().fg(FG)))))
                     .collect()
             } else { order
                 .iter()
                 .enumerate()
                 .skip(offset)
-                .take(view_h)                .map(|(vi, &ei)| {
+                .take(drawn_h)                .map(|(vi, &ei)| {
                     let selected = (offset + vi) == cursor;
                     let mark_style = if selected {
                         Style::default().fg(MARK).bg(Color::Black).add_modifier(Modifier::BOLD)
@@ -583,12 +595,12 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             // Scrollbar (fzf style): dim track + bright thumb on last column.
             // In answer mode it follows ans_scroll over the answer lines.
             let (sb_total, sb_off) = if answering { (ans_lines.len(), ans_scroll) } else { (order.len(), offset) };
-            if sb_total > view_h {
+            if sb_total > drawn_h {
                 let list_area = rows[3];
                 let sx = list_area.right().saturating_sub(1);
-                let (start, th) = thumb(view_h, sb_total, sb_off);
+                let (start, th) = thumb(drawn_h, sb_total, sb_off);
                 let buf = f.buffer_mut();
-                for i in 0..view_h {
+                for i in 0..drawn_h {
                     let y = list_area.y + i as u16;
                     if y >= list_area.bottom() {
                         break;
@@ -601,6 +613,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             }
             f.set_cursor_position((rows[0].x + cell_w(&format!("   ⚡ {}", query)), rows[0].y));
             });
+            geo = drawn_geo;
         }
         // draw() flushes the buffer: single write per frame (no tearing).
         // Cursor stays visible the whole time, parked at input (fzf style).
