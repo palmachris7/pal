@@ -511,9 +511,13 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     Constraint::Min(1),
                 ])
                 .split(inner);
-            let prompt_line = format!("   ⚡ {}  {}/{}", query, order.len(), entries.len());
+            let prompt_line = format!("   ⚡ {}", query);
+            let status_line = format!("  {}/{} #{} o{}", order.len(), entries.len(), cursor, offset);
             f.render_widget(
-                Paragraph::new(prompt_line.as_str()).style(Style::default().fg(PROMPT).add_modifier(Modifier::BOLD)),
+                Paragraph::new(Line::from(vec![
+                    Span::styled(prompt_line.as_str(), Style::default().fg(PROMPT).add_modifier(Modifier::BOLD)),
+                    Span::styled(status_line, Style::default().fg(BORDER)),
+                ])),
                 rows[0],
             );
             f.render_widget(
