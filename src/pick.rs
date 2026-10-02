@@ -522,7 +522,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 .split(inner);
             let prompt_line = format!("   ⚡ {}", query);
             let ans_flag = if answering { format!(" A{}", ans_lines.len()) } else { String::new() };
-            let status_line = format!("  {}/{} #{} o{} {}{}{}", order.len(), entries.len(), cursor, offset, ev_last, ev_count, ans_flag);
+            let status_line = format!("  {}/{} #{} o{} {}{}{} e{}", order.len(), entries.len(), cursor, offset, ev_last, ev_count, ans_flag, err_streak);
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(prompt_line.as_str(), Style::default().fg(PROMPT).add_modifier(Modifier::BOLD)),
@@ -718,8 +718,16 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             }
         }
         match ev {
-            Event::FocusGained => focused = true,
-            Event::FocusLost => focused = false,
+            Event::FocusGained => {
+                focused = true;
+                ev_count += 1;
+                ev_last = 'F';
+            }
+            Event::FocusLost => {
+                focused = false;
+                ev_count += 1;
+                ev_last = 'f';
+            }
             Event::Key(k) => {
                 ev_count += 1;
                 ev_last = match k.code {
@@ -890,10 +898,20 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     MouseEventKind::Up(_) => {
                         drag_grab = None;
                     }
-                    _ => {}
+                    _ => {
+                        ev_count += 1;
+                        ev_last = '?';
+                    }
                 }
             }
-            _ => {}
+            Event::Resize(_, _) => {
+                ev_count += 1;
+                ev_last = 'R';
+            }
+            Event::Paste(_) => {
+                ev_count += 1;
+                ev_last = 'P';
+            }
         }
     }
 }
