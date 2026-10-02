@@ -506,7 +506,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     Constraint::Min(1),
                 ])
                 .split(inner);
-            let prompt_line = format!("   ⚡ {}", query);
+            let prompt_line = format!("   ⚡ {}  {}/{}", query, order.len(), entries.len());
             f.render_widget(
                 Paragraph::new(prompt_line.as_str()).style(Style::default().fg(PROMPT).add_modifier(Modifier::BOLD)),
                 rows[0],
@@ -599,7 +599,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                         .set_fg(if is_thumb { Color::White } else { BORDER });
                 }
             }
-            f.set_cursor_position((rows[0].x + cell_w(&prompt_line), rows[0].y));
+            f.set_cursor_position((rows[0].x + cell_w(&format!("   ⚡ {}", query)), rows[0].y));
             });
         }
         // draw() flushes the buffer: single write per frame (no tearing).
