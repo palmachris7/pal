@@ -73,6 +73,10 @@ fn main() {
     if args.len() >= 2 && args[0] == "--open" {
         std::process::exit(herdr::open_cmd(&args[1]));
     }
+    if args.first().map(|s| s.as_str()) == Some("--version") {
+        println!("pal {} ({})", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
+        return;
+    }
 
     let dir = config_dir();
     let _ = fs::create_dir_all(&dir);
