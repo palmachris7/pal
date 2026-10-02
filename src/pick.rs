@@ -718,9 +718,16 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                             }
                             ans_pinned = ans_scroll == ans_lines.len().saturating_sub(view_h);
                         } else if m.kind == MouseEventKind::ScrollUp {
-                            cursor = cursor.saturating_sub(wheel_step);
+                            // Wheel scrolls the VIEWPORT (selection stays put).
+                            offset = offset.saturating_sub(wheel_step);
+                            if !order.is_empty() && cursor < offset {
+                                cursor = offset;
+                            }
                         } else {
-                            cursor = (cursor + wheel_step).min(max_cur);
+                            offset = (offset + wheel_step).min(max_off);
+                            if !order.is_empty() && cursor >= offset + view_h {
+                                cursor = (offset + view_h).saturating_sub(1).min(max_cur);
+                            }
                         }
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
