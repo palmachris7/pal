@@ -361,8 +361,6 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     let mut query = String::new();
     let mut cursor: usize = 0;
     let mut offset: usize = 0;
-    let mut last_wheel: Option<Instant> = None;
-    let mut wheel_step: usize = 1;
     let mut drag_grab: Option<usize> = None;
     let mut pending: Option<Event> = None;
     let mut err_streak: usize = 0;
@@ -638,20 +636,56 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             }
         };
         let Some(first) = first else { continue };
-        // Coalesce drag bursts: redraw once per burst, not per event.
+        // Coalesce bursts, redraw once per burst:
+        // - drag: keep latest position (position-based, intermediates useless).
+        // - wheel: accumulate same-direction ticks (trackpads fire dozens/sec;
+        //   movement follows the finger: slow = 1 row, flick = up to cap).
         let mut ev = first;
-        if matches!(ev, Event::Mouse(m) if matches!(m.kind, MouseEventKind::Drag(_))) {
-            while event::poll(std::time::Duration::ZERO).unwrap_or(false) {
-                match event::read() {
-                    Ok(Event::Mouse(nm)) if matches!(nm.kind, MouseEventKind::Drag(_)) => {
+        let mut wheel_acc: usize = 1;
+        loop {
+            let wheel_dir = match &ev {
+                Event::Mouse(m) => match m.kind {
+                    MouseEventKind::ScrollUp => Some(true),
+                    MouseEventKind::ScrollDown => Some(false),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let is_drag = matches!(ev, Event::Mouse(m) if matches!(m.kind, MouseEventKind::Drag(_)));
+            if wheel_dir.is_none() && !is_drag {
+                break;
+            }
+            if !event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+                break;
+            }
+            match event::read() {
+                Ok(Event::Mouse(nm)) if matches!(nm.kind, MouseEventKind::Drag(_)) && is_drag => {
+                    ev = Event::Mouse(nm);
+                }
+                Ok(Event::Mouse(nm)) => {
+                    let same_dir = match nm.kind {
+                        MouseEventKind::ScrollUp => wheel_dir == Some(true),
+                        MouseEventKind::ScrollDown => wheel_dir == Some(false),
+                        _ => false,
+                    };
+                    if same_dir {
+                        wheel_acc += 1;
                         ev = Event::Mouse(nm);
-                    }
-                    Ok(other) => {
-                        pending = Some(other);
+                        // Cap per frame BUT stop draining: leftovers stay queued
+                        // for next frames (glide), never dropped.
+                        if wheel_acc >= 12 {
+                            break;
+                        }
+                    } else {
+                        pending = Some(Event::Mouse(nm));
                         break;
                     }
-                    Err(_) => break,
                 }
+                Ok(other) => {
+                    pending = Some(other);
+                    break;
+                }
+                Err(_) => break,
             }
         }
         match ev {
@@ -725,25 +759,20 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 let set_ans_scroll = |v: usize, view_h: usize, len: usize| v.min(len.saturating_sub(view_h));
                 match m.kind {
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                        // Natural wheel: 1 by 1, accelerates while spinning fast.
-                        let now = Instant::now();
-                        if last_wheel.is_some_and(|t| now - t < std::time::Duration::from_millis(150)) {
-                            wheel_step = (wheel_step + 1).min(8);
-                        } else {
-                            wheel_step = 1;
-                        }
-                        last_wheel = Some(now);
+                        // wheel_acc comes from burst coalescing above:
+                        // slow finger = 1 row, fast flick = up to 12.
+                        let step = wheel_acc;
                         if answering {
                             if m.kind == MouseEventKind::ScrollUp {
-                                ans_scroll = ans_scroll.saturating_sub(wheel_step);
+                                ans_scroll = ans_scroll.saturating_sub(step);
                             } else {
-                                ans_scroll = set_ans_scroll(ans_scroll + wheel_step, view_h, ans_lines.len());
+                                ans_scroll = set_ans_scroll(ans_scroll + step, view_h, ans_lines.len());
                             }
                             ans_pinned = ans_scroll == ans_lines.len().saturating_sub(view_h);
                         } else if m.kind == MouseEventKind::ScrollUp {
-                            cursor = cursor.saturating_sub(wheel_step);
+                            cursor = cursor.saturating_sub(step);
                         } else {
-                            cursor = (cursor + wheel_step).min(max_cur);
+                            cursor = (cursor + step).min(max_cur);
                         }
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
