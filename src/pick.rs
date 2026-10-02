@@ -158,6 +158,40 @@ fn row_to_offset(r: usize, grab: usize, view_h: usize, th_len: usize, total: usi
     (r.saturating_sub(grab) * span / denom).min(span)
 }
 
+/// Minimal self-diagnostic journal (numbers only, no content).
+/// One line per STATE CHANGE + exit reason. For remote debugging.
+struct Journal {
+    path: std::path::PathBuf,
+    last: String,
+}
+
+impl Journal {
+    fn open() -> Self {
+        // Fixed stable path (both user and debugger can find it).
+        let path = std::path::PathBuf::from("/tmp/pal-journal.log");
+        // Cap: restart file past 200KB.
+        if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 200_000 {
+            let _ = std::fs::remove_file(&path);
+        }
+        Journal { path, last: String::new() }
+    }
+
+    fn line(&mut self, msg: String) {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
+            let _ = writeln!(f, "{}", msg);
+        }
+    }
+
+    fn state(&mut self, cursor: usize, offset: usize, n: usize, view: usize, qlen: usize, ans: bool, evn: u64) {
+        let s = format!("c{} o{} n{} v{} q{} a{} e{}", cursor, offset, n, view, qlen, ans as u8, evn);
+        if s != self.last {
+            self.last = s.clone();
+            self.line(s);
+        }
+    }
+}
+
 /// `?pregunta` / `??idea` → (opencode, texto). None = not a question.
 // TODO: multi-agent config; por ahora todo es opencode.
 fn is_question(q: &str) -> Option<(&'static str, String)> {
@@ -387,6 +421,14 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     let mut last_key: Option<(String, usize, usize, usize, usize, bool, usize, usize, usize, bool, u64)> = None;
     // Single source of geometry truth: the LAST DRAWN layout.
     // (list_y, list_h, scroll_x). Events map to pixels that exist.
+    let mut journal = Journal::open();
+    journal.line(format!(
+        "start version={} entries={} size={:?}",
+        env!("CARGO_PKG_VERSION"),
+        entries.len(),
+        term.size().map(|s| (s.width, s.height)).unwrap_or((0, 0))
+    ));
+    // (list_y, list_h, scroll_x) tuples follow below in geo.
     let mut geo: (usize, usize, usize) = (4, 20, 98);
 
     loop {
@@ -469,6 +511,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
         } else if cursor >= offset + view_h {
             offset = cursor + 1 - view_h;
         }
+        journal.state(cursor, offset, order.len(), view_h, query.len(), answering, ev_count);
         // Answer scroll: clamp every frame (resize-safe) + tail-follow.
         let ans_max = ans_lines.len().saturating_sub(view_h);
         if ans_scroll > ans_max {
@@ -742,10 +785,12 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 match (k.code, k.modifiers) {
             (KeyCode::Esc, _) => {
                 kill_answer(&mut ans_child);
+                journal.line("exit esc".into());
                 return None;
             }
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 kill_answer(&mut ans_child);
+                journal.line("exit ctrlc".into());
                 return None;
             }
             (KeyCode::Enter, _) => {
@@ -754,6 +799,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     if answering && !ans_lines.is_empty() {
                         // Respuesta lista: copiar y salir sin ventana.
                         copy_answer(&ans_lines);
+                        journal.line("exit enter-copy".into());
                         return Some((String::new(), None));
                     }
                     // Sin respuesta aún (Enter rápido): lanzar ya y quedarse.
@@ -764,6 +810,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     last_type = Instant::now() - Duration::from_secs(3600);
                 } else {
                     let sel = order.get(cursor).map(|&i| entries[i].clone());
+                    journal.line(format!("exit enter sel={}", sel.is_some() as u8));
                     return Some((query, sel));
                 }
             }
