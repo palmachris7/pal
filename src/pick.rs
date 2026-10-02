@@ -457,11 +457,9 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
         if offset > max_off {
             offset = max_off;
         }
-        if cursor < offset {
-            offset = cursor;
-        } else if cursor >= offset + view_h {
-            offset = cursor + 1 - view_h;
-        }
+        // NOTE: no cursor-follow snap here on purpose: the wheel roams the
+        // viewport freely while the selection stays (Gmail-style). Keyboard
+        // nav snaps the viewport in its own arms below.
         // Answer scroll: clamp every frame (resize-safe) + tail-follow.
         let ans_max = ans_lines.len().saturating_sub(view_h);
         if ans_scroll > ans_max {
@@ -663,6 +661,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             (KeyCode::Backspace, _) => {
                 query.pop();
                 cursor = 0;
+                offset = 0;
                 drag_grab = None;
                 reset_answer(&mut ans_child, &mut ans_active, &mut ans_lines, &mut ans_scroll);
                 ans_pinned = true;
@@ -674,6 +673,9 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     ans_pinned = false;
                 } else {
                     cursor = cursor.saturating_sub(1);
+                    if cursor < offset {
+                        offset = cursor;
+                    }
                 }
             }
             (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
@@ -681,13 +683,19 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     let max_s = ans_lines.len().saturating_sub(view_h);
                     ans_scroll = (ans_scroll + 1).min(max_s);
                     ans_pinned = ans_scroll == max_s;
-                } else if cursor + 1 < order.len() {
-                    cursor += 1;
+                } else {
+                    if cursor + 1 < order.len() {
+                        cursor += 1;
+                    }
+                    if cursor >= offset + view_h {
+                        offset = cursor + 1 - view_h;
+                    }
                 }
             }
             (KeyCode::Char(ch), KeyModifiers::NONE) | (KeyCode::Char(ch), KeyModifiers::SHIFT) => {
                 query.push(ch);
                 cursor = 0;
+                offset = 0;
                 drag_grab = None;
                 reset_answer(&mut ans_child, &mut ans_active, &mut ans_lines, &mut ans_scroll);
                 ans_pinned = true;
