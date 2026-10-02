@@ -521,7 +521,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 ])
                 .split(inner);
             let prompt_line = format!("   ⚡ {}", query);
-            let status_line = format!("  {}/{} #{} o{} {}{}", order.len(), entries.len(), cursor, offset, ev_last, ev_count);
+            let ans_flag = if answering { format!(" A{}", ans_lines.len()) } else { String::new() };
+            let status_line = format!("  {}/{} #{} o{} {}{}{}", order.len(), entries.len(), cursor, offset, ev_last, ev_count, ans_flag);
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(prompt_line.as_str(), Style::default().fg(PROMPT).add_modifier(Modifier::BOLD)),
