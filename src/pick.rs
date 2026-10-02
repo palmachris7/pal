@@ -367,6 +367,9 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     let mut pending: Option<Event> = None;
     let mut err_streak: usize = 0;
     let mut focused = true;
+    // Event ticker (diagnostic + life sign): last event glyph + count.
+    let mut ev_last: char = '·';
+    let mut ev_count: u64 = 0;
     // Inline answer state (? / ?? questions).
     let mut ans_lines: Vec<String> = vec![];
     let mut ans_scroll: usize = 0;
@@ -381,7 +384,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     // Beauty state: tail-follow, spinner frame, frame-pacing key.
     let mut ans_pinned = true;
     let mut spin: usize = 0;
-    let mut last_key: Option<(String, usize, usize, usize, usize, bool, usize, usize, usize, bool)> = None;
+    let mut last_key: Option<(String, usize, usize, usize, usize, bool, usize, usize, usize, bool, u64)> = None;
     // Single source of geometry truth: the LAST DRAWN layout.
     // (list_y, list_h, scroll_x). Events map to pixels that exist.
     let mut geo: (usize, usize, usize) = (4, 20, 98);
@@ -494,6 +497,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             kw,
             kh,
             focused,
+            ev_count,
         );
         if last_key.as_ref() != Some(&key) {
             last_key = Some(key);
@@ -517,7 +521,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 ])
                 .split(inner);
             let prompt_line = format!("   ⚡ {}", query);
-            let status_line = format!("  {}/{} #{} o{}", order.len(), entries.len(), cursor, offset);
+            let status_line = format!("  {}/{} #{} o{} {}{}", order.len(), entries.len(), cursor, offset, ev_last, ev_count);
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(prompt_line.as_str(), Style::default().fg(PROMPT).add_modifier(Modifier::BOLD)),
@@ -715,7 +719,18 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
         match ev {
             Event::FocusGained => focused = true,
             Event::FocusLost => focused = false,
-            Event::Key(k) => match (k.code, k.modifiers) {
+            Event::Key(k) => {
+                ev_count += 1;
+                ev_last = match k.code {
+                    KeyCode::Up => '↑',
+                    KeyCode::Down => '↓',
+                    KeyCode::Enter => '⏎',
+                    KeyCode::Esc => '⎋',
+                    KeyCode::Backspace => '⌫',
+                    KeyCode::Char(c) => c,
+                    _ => '·',
+                };
+                match (k.code, k.modifiers) {
             (KeyCode::Esc, _) => {
                 kill_answer(&mut ans_child);
                 return None;
@@ -777,8 +792,18 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 last_type = Instant::now();
             }
             _ => {}
+            }
             },
             Event::Mouse(m) => {
+                ev_count += 1;
+                ev_last = match m.kind {
+                    MouseEventKind::ScrollUp => '▲',
+                    MouseEventKind::ScrollDown => '▼',
+                    MouseEventKind::Down(_) => '●',
+                    MouseEventKind::Drag(_) => '◎',
+                    MouseEventKind::Up(_) => '○',
+                    _ => '·',
+                };
                 let max_cur = order.len().saturating_sub(1);
                 // Answer mode scrolls ans_lines with the same scrollbar math.
                 let (sb_total, sb_off) = if answering { (ans_lines.len(), ans_scroll) } else { (order.len(), offset) };
