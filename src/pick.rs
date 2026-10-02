@@ -20,15 +20,121 @@ use ratatui::{
 };
 use ratatui::backend::CrosstermBackend;
 use std::io;
+use unicode_width::UnicodeWidthStr;
 
+// Palette roles (one accent, nord soul):
+// BORDER = quiet chrome, FG = content, PROMPT = input voice,
+// HEADER = dim context, MARK = the single accent (gutter/thumb/spinner),
+// HL = matched-query shimmer, White = selection climax.
 const FG: Color = Color::Rgb(0x81, 0xa1, 0xc1);
 const PROMPT: Color = Color::Rgb(0x8f, 0xbc, 0xbb);
 const BORDER: Color = Color::Rgb(0x5e, 0x81, 0xac);
 const HEADER: Color = Color::Indexed(109);
 const MARK: Color = Color::Indexed(161);
+const HL: Color = Color::Rgb(0x88, 0xc0, 0xd0);
+const CODE: Color = Color::Indexed(180);
+
+const SPIN: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠿"];
 
 fn cell_w(s: &str) -> u16 {
-    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+    UnicodeWidthStr::width(s) as u16
+}
+
+/// Elegant truncation: cut by cell width, end with … (never mid-word abrupt).
+fn fit(s: &str, max_w: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max_w {
+        return s.to_string();
+    }
+    let mut w = 0;
+    let mut out = String::new();
+    for c in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+        if w + cw + 1 > max_w {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// (display_text, char_offset_of_display_within_entry).
+fn display_span(entry: &str) -> (String, usize) {
+    let Some(pos) = entry.find('|') else {
+        return (entry.to_string(), 0);
+    };
+    let pre: usize = entry[..pos].chars().count() + 1;
+    let rest = &entry[pos + 1..];
+    let lead: usize = rest.chars().take_while(|c| c.is_whitespace()).count();
+    (rest.trim().to_string(), pre + lead)
+}
+
+/// Per-char highlight spans for matched indices (char positions in `text`).
+fn hl_spans(text: &str, hits: &[u32], base: Style, hl: Style) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut cur: Option<(bool, String)> = None;
+    for (i, c) in text.chars().enumerate() {
+        let hit = hits.contains(&(i as u32));
+        match &mut cur {
+            Some((h, s)) if *h == hit => s.push(c),
+            _ => {
+                if let Some((h, s)) = cur.take() {
+                    out.push(Span::styled(s, if h { hl } else { base }));
+                }
+                cur = Some((hit, c.to_string()));
+            }
+        }
+    }
+    if let Some((h, s)) = cur.take() {
+        out.push(Span::styled(s, if h { hl } else { base }));
+    }
+    out
+}
+
+/// Minimal markdown: `# ` title, `**bold**`, `` `code` ``. Quiet, not clever.
+fn md_spans(line: &str, base: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = line;
+    if let Some(t) = rest.strip_prefix("### ") {
+        spans.push(Span::styled(format!("  {}", t), base.fg(Color::White).add_modifier(Modifier::BOLD)));
+        return spans;
+    }
+    if let Some(t) = rest.strip_prefix("## ") {
+        spans.push(Span::styled(format!("  {}", t), base.fg(Color::White).add_modifier(Modifier::BOLD)));
+        return spans;
+    }
+    if let Some(t) = rest.strip_prefix("# ") {
+        spans.push(Span::styled(format!("  {}", t), base.fg(Color::White).add_modifier(Modifier::BOLD)));
+        return spans;
+    }
+    spans.push(Span::raw("  "));
+    let bold = base.fg(Color::White).add_modifier(Modifier::BOLD);
+    let code = base.fg(CODE);
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("**") {
+            if let Some(end) = after.find("**") {
+                spans.push(Span::styled(after[..end].to_string(), bold));
+                rest = &after[end + 2..];
+                continue;
+            }
+        }
+        if let Some(after) = rest.strip_prefix('`') {
+            if let Some(end) = after.find('`') {
+                spans.push(Span::styled(after[..end].to_string(), code));
+                rest = &after[end + 1..];
+                continue;
+            }
+        }
+        // Emit up to next marker.
+        let next_bb = rest.find("**").unwrap_or(rest.len());
+        let next_bt = rest.find('`').unwrap_or(rest.len());
+        let n = next_bb.min(next_bt).max(1);
+        let (head, tail) = rest.split_at(n);
+        spans.push(Span::styled(head.to_string(), base));
+        rest = tail;
+    }
+    spans
 }
 
 /// Thumb metrics (single source of truth, fzf getScrollbar style).
@@ -50,11 +156,6 @@ fn row_to_offset(r: usize, grab: usize, view_h: usize, th_len: usize, total: usi
     }
     let denom = (view_h - th_len).max(1);
     (r.saturating_sub(grab) * span / denom).min(span)
-}
-
-/// Display part of an entry (fzf --with-nth=2 equivalent).
-pub fn display(entry: &str) -> String {
-    entry.split('|').nth(1).map(|s| s.trim().to_string()).unwrap_or_else(|| entry.to_string())
 }
 
 /// `?pregunta` / `??idea` → (opencode, texto). None = not a question.
@@ -206,11 +307,15 @@ fn spawn_answer(
     Some(child)
 }
 
-fn rank(entries: &[String], query: &str) -> Vec<usize> {
+#[cfg(test)]
+fn rank_pub(entries: &[String], query: &str) -> Vec<usize> {
     if query.is_empty() {
         return (0..entries.len()).collect();
     }
-    let pat = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    rank_with(entries, &Pattern::parse(query, CaseMatching::Smart, Normalization::Smart))
+}
+
+fn rank_with(entries: &[String], pat: &Pattern) -> Vec<usize> {
     let mut matcher = Matcher::new(Config::DEFAULT);
     let mut buf = Vec::new();
     let mut scored: Vec<(u32, usize)> = vec![];
@@ -222,6 +327,25 @@ fn rank(entries: &[String], query: &str) -> Vec<usize> {
     }
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     scored.into_iter().map(|(_, i)| i).collect()
+}
+
+/// Matched char indices within the DISPLAY text (for highlight).
+fn match_indices(entry: &str, pat: &Pattern) -> Vec<u32> {
+    let (text, off) = display_span(entry);
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut buf = Vec::new();
+    let hay = Utf32Str::new(entry, &mut buf);
+    let mut idx: Vec<u32> = vec![];
+    if pat.indices(hay, &mut matcher, &mut idx).is_none() {
+        return vec![];
+    }
+    idx.sort_unstable();
+    idx.dedup();
+    let n = text.chars().count() as u32;
+    idx.into_iter()
+        .filter_map(|i| i.checked_sub(off as u32))
+        .filter(|i| *i < n)
+        .collect()
 }
 
 /// Run the picker. Returns (query, selection?) or None on abort.
@@ -252,9 +376,21 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     let mut ans_last_q = String::new();
     let mut ans_session: Option<String> = None;
     let mut last_type = Instant::now();
+    // Beauty state: tail-follow, spinner frame, frame-pacing key.
+    let mut ans_pinned = true;
+    let mut spin: usize = 0;
+    let mut last_key: Option<(String, usize, usize, usize, usize, bool, usize, usize, usize)> = None;
 
     loop {
-        let order = rank(entries, &query);
+        let pat = if query.is_empty() {
+            None
+        } else {
+            Some(Pattern::parse(&query, CaseMatching::Smart, Normalization::Smart))
+        };
+        let order = match &pat {
+            Some(p) => rank_with(entries, p),
+            None => (0..entries.len()).collect(),
+        };
         if cursor >= order.len() && !order.is_empty() {
             cursor = order.len() - 1;
         }
@@ -326,7 +462,32 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
         } else if cursor >= offset + view_h {
             offset = cursor + 1 - view_h;
         }
-        let _ = term.draw(|f| {
+        // Answer scroll: clamp every frame (resize-safe) + tail-follow.
+        let ans_max = ans_lines.len().saturating_sub(view_h);
+        if ans_scroll > ans_max {
+            ans_scroll = ans_max;
+        }
+        if answering && ans_pinned {
+            ans_scroll = ans_max;
+        }
+        if ans_active.is_some() {
+            spin += 1;
+        }
+        // Frame pacing: skip identical frames (rhythm without storms).
+        let key = (
+            query.clone(),
+            cursor,
+            offset,
+            ans_scroll,
+            ans_lines.len(),
+            ans_active.is_some(),
+            spin,
+            term_w,
+            view_h,
+        );
+        if last_key.as_ref() != Some(&key) {
+            last_key = Some(key);
+            let _ = term.draw(|f| {
             let area = f.area();
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -355,7 +516,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             );
             let header_txt = if answering {
                 if ans_active.is_some() {
-                    format!("   ✦ {} está respondiendo… (Enter copia y sale, Esc cierra)", ans_agent)
+                    format!("   {} {} está respondiendo… (Enter copia y sale, Esc cierra)", SPIN[spin % SPIN.len()], ans_agent)
                 } else {
                     format!("   ✦ respuesta de {} (Enter copia y sale, Esc cierra)", ans_agent)
                 }
@@ -367,19 +528,21 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     .style(Style::default().fg(HEADER)),
                 rows[2],
             );
+            // Content width: indent + 1 column reserved for scrollbar.
+            let content_w = (rows[3].width as usize).saturating_sub(1);
             let items: Vec<ListItem> = if answering {
                 ans_lines
                     .iter()
                     .skip(ans_scroll)
                     .take(view_h)
-                    .map(|l| ListItem::new(Line::from(vec![Span::styled(format!("  {}", l), Style::default().fg(FG))])))
+                    .map(|l| ListItem::new(Line::from(md_spans(&fit(l, content_w.saturating_sub(2)), Style::default().fg(FG)))))
                     .collect()
             } else { order
                 .iter()
                 .enumerate()
                 .skip(offset)
                 .take(view_h)                .map(|(vi, &ei)| {
-                    let selected = vi == cursor;
+                    let selected = (offset + vi) == cursor;
                     let mark_style = if selected {
                         Style::default().fg(MARK).bg(Color::Black).add_modifier(Modifier::BOLD)
                     } else {
@@ -390,11 +553,27 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     } else {
                         Style::default().fg(FG)
                     };
-                    ListItem::new(Line::from(vec![
-                        Span::raw(" "),
-                        Span::styled("▌", mark_style),
-                        Span::styled(format!("  {}", display(&entries[ei])), text_style),
-                    ]))
+                    let (text, _) = display_span(&entries[ei]);
+                    let fitted = fit(&text, content_w.saturating_sub(4));
+                    if selected || pat.is_none() {
+                        ListItem::new(Line::from(vec![
+                            Span::raw(" "),
+                            Span::styled("▌", mark_style),
+                            Span::styled(format!("  {}", fitted), text_style),
+                        ]))
+                    } else {
+                        let hits = match_indices(&entries[ei], pat.as_ref().unwrap());
+                        let n = fitted.chars().count() as u32;
+                        let hits: Vec<u32> = hits.into_iter().filter(|i| *i < n).collect();
+                        let mut spans = vec![Span::raw(" "), Span::styled("▌", mark_style), Span::raw("  ")];
+                        spans.extend(hl_spans(
+                            &fitted,
+                            &hits,
+                            text_style,
+                            Style::default().fg(HL).add_modifier(Modifier::BOLD),
+                        ));
+                        ListItem::new(Line::from(spans))
+                    }
                 })
                 .collect()
             };
@@ -419,7 +598,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 }
             }
             f.set_cursor_position((rows[0].x + cell_w(&prompt_line), rows[0].y));
-        });
+            });
+        }
         // draw() flushes the buffer: single write per frame (no tearing).
         // Cursor stays visible the whole time, parked at input (fzf style).
 
@@ -485,18 +665,22 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 cursor = 0;
                 drag_grab = None;
                 reset_answer(&mut ans_child, &mut ans_active, &mut ans_lines, &mut ans_scroll);
+                ans_pinned = true;
                 last_type = Instant::now();
             }
             (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                 if answering {
                     ans_scroll = ans_scroll.saturating_sub(1);
+                    ans_pinned = false;
                 } else {
                     cursor = cursor.saturating_sub(1);
                 }
             }
             (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                 if answering {
-                    ans_scroll = (ans_scroll + 1).min(ans_lines.len().saturating_sub(view_h));
+                    let max_s = ans_lines.len().saturating_sub(view_h);
+                    ans_scroll = (ans_scroll + 1).min(max_s);
+                    ans_pinned = ans_scroll == max_s;
                 } else if cursor + 1 < order.len() {
                     cursor += 1;
                 }
@@ -506,13 +690,16 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 cursor = 0;
                 drag_grab = None;
                 reset_answer(&mut ans_child, &mut ans_active, &mut ans_lines, &mut ans_scroll);
+                ans_pinned = true;
                 last_type = Instant::now();
             }
             _ => {}
             },
             Event::Mouse(m) => {
                 let max_cur = order.len().saturating_sub(1);
-                let total = order.len();
+                // Answer mode scrolls ans_lines with the same scrollbar math.
+                let (sb_total, sb_off) = if answering { (ans_lines.len(), ans_scroll) } else { (order.len(), offset) };
+                let set_ans_scroll = |v: usize, view_h: usize, len: usize| v.min(len.saturating_sub(view_h));
                 match m.kind {
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                         // Natural wheel: 1 by 1, accelerates while spinning fast.
@@ -527,9 +714,9 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                             if m.kind == MouseEventKind::ScrollUp {
                                 ans_scroll = ans_scroll.saturating_sub(wheel_step);
                             } else {
-                                ans_scroll = (ans_scroll + wheel_step)
-                                    .min(ans_lines.len().saturating_sub(view_h));
+                                ans_scroll = set_ans_scroll(ans_scroll + wheel_step, view_h, ans_lines.len());
                             }
+                            ans_pinned = ans_scroll == ans_lines.len().saturating_sub(view_h);
                         } else if m.kind == MouseEventKind::ScrollUp {
                             cursor = cursor.saturating_sub(wheel_step);
                         } else {
@@ -538,38 +725,62 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         let row = m.row as usize;
-                        if total > view_h
+                        if sb_total > view_h
                             && m.column as usize == scroll_x
                             && row >= list_y
                             && row < list_y + view_h
                         {
                             let r = row - list_y;
-                            let (th_start, th_len) = thumb(view_h, total, offset);
-                            if r >= th_start && r < th_start + th_len {
+                            let (th_start, th_len) = thumb(view_h, sb_total, sb_off);
+                            let grab = if r >= th_start && r < th_start + th_len {
                                 // Grabbed the thumb: no jump, follow the finger.
-                                drag_grab = Some(r - th_start);
+                                r - th_start
                             } else {
                                 // Clicked the track: jump, grab middle for smooth drag.
-                                let grab = th_len / 2;
-                                offset = row_to_offset(r, grab, view_h, th_len, total);
+                                th_len / 2
+                            };
+                            let new_off = row_to_offset(r, grab, view_h, th_len, sb_total);
+                            if answering {
+                                ans_scroll = new_off;
+                                ans_pinned = ans_scroll == ans_lines.len().saturating_sub(view_h);
+                            } else {
+                                offset = new_off;
                                 cursor = cursor.clamp(offset, (offset + view_h - 1).min(max_cur));
-                                drag_grab = Some(grab);
                             }
+                            drag_grab = Some(grab);
                         } else if row >= list_y && row < list_y + view_h && !order.is_empty() {
-                            cursor = (offset + row - list_y).min(max_cur);
+                            if answering {
+                                let r = row - list_y;
+                                ans_scroll = set_ans_scroll(r * sb_total / view_h, view_h, sb_total);
+                                ans_pinned = ans_scroll == ans_lines.len().saturating_sub(view_h);
+                            } else {
+                                cursor = (offset + row - list_y).min(max_cur);
+                            }
                             drag_grab = None;
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
-                        if total <= view_h || order.is_empty() {
+                        if sb_total <= view_h || order.is_empty() && !answering {
                         } else if let Some(grab) = drag_grab {
                             // Scrollbar drag: inverse mapping, clamped to ends.
                             let r = (m.row as usize).clamp(list_y, list_y + view_h - 1) - list_y;
-                            let (_, th_len) = thumb(view_h, total, offset);
-                            offset = row_to_offset(r, grab.min(view_h), view_h, th_len, total);
-                            cursor = cursor.clamp(offset, (offset + view_h - 1).min(max_cur));
+                            let (_, th_len) = thumb(view_h, sb_total, sb_off);
+                            let new_off = row_to_offset(r, grab.min(view_h), view_h, th_len, sb_total);
+                            if answering {
+                                ans_scroll = new_off;
+                                ans_pinned = ans_scroll == ans_lines.len().saturating_sub(view_h);
+                            } else {
+                                offset = new_off;
+                                cursor = cursor.clamp(offset, (offset + view_h - 1).min(max_cur));
+                            }
                         } else if (m.row as usize) >= list_y && (m.row as usize) < list_y + view_h {
-                            cursor = (offset + (m.row as usize) - list_y).min(max_cur);
+                            if answering {
+                                let r = (m.row as usize) - list_y;
+                                ans_scroll = set_ans_scroll(r * sb_total / view_h, view_h, sb_total);
+                                ans_pinned = ans_scroll == ans_lines.len().saturating_sub(view_h);
+                            } else {
+                                cursor = (offset + (m.row as usize) - list_y).min(max_cur);
+                            }
                         }
                     }
                     MouseEventKind::Up(_) => {
@@ -621,26 +832,45 @@ mod tests {
     #[test]
     fn empty_query_keeps_frecency_order() {
         let e = sample();
-        assert_eq!(rank(&e, ""), vec![0, 1, 2]);
+        assert_eq!(rank_pub(&e, ""), vec![0, 1, 2]);
     }
 
     #[test]
     fn abbreviations_hit_expected_entry_first() {
         let e = sample();
-        assert_eq!(rank(&e, "yazi")[0], 0);
-        assert_eq!(rank(&e, "msc")[0], 1);
-        assert_eq!(rank(&e, "lg")[0], 2);
+        assert_eq!(rank_pub(&e, "yazi")[0], 0);
+        assert_eq!(rank_pub(&e, "msc")[0], 1);
+        assert_eq!(rank_pub(&e, "lg")[0], 2);
     }
 
     #[test]
     fn no_match_gives_empty() {
         let e = sample();
-        assert!(rank(&e, "zzzqqq").is_empty());
+        assert!(rank_pub(&e, "zzzqqq").is_empty());
     }
 
     #[test]
     fn display_shows_command_part() {
-        assert_eq!(display("/x | msc → music"), "msc → music");
+        assert_eq!(display_span("/x | msc → music").0, "msc → music");
+        assert_eq!(display_span("/x | msc → music").1, 5);
+        assert_eq!(display_span("plain"), ("plain".into(), 0));
+    }
+
+    #[test]
+    fn fit_truncates_by_width() {
+        assert_eq!(fit("hola", 10), "hola");
+        assert_eq!(fit("hola mundo", 7), "hola m…");
+        assert_eq!(fit("abc", 3), "abc");
+    }
+
+    #[test]
+    fn match_indices_hit_display() {
+        let pat = Pattern::parse("msc", CaseMatching::Smart, Normalization::Smart);
+        let hits = match_indices("/bin | msc → music", &pat);
+        // display "msc → music": m,s,c at 0,1,2.
+        assert!(hits.contains(&0) && hits.contains(&1) && hits.contains(&2));
+        let pat2 = Pattern::parse("zzz", CaseMatching::Smart, Normalization::Smart);
+        assert!(match_indices("/bin | msc → music", &pat2).is_empty());
     }
 
     #[test]
