@@ -357,6 +357,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     {
         use crossterm::ExecutableCommand;
         let _ = io::stderr().execute(crossterm::event::EnableMouseCapture);
+        // Focus reporting (DECSET 1004): harmless if the terminal ignores it.
+        let _ = io::stderr().execute(crossterm::event::EnableFocusChange);
     }
     let mut query = String::new();
     let mut cursor: usize = 0;
@@ -364,6 +366,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     let mut drag_grab: Option<usize> = None;
     let mut pending: Option<Event> = None;
     let mut err_streak: usize = 0;
+    let mut focused = true;
     // Inline answer state (? / ?? questions).
     let mut ans_lines: Vec<String> = vec![];
     let mut ans_scroll: usize = 0;
@@ -378,7 +381,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     // Beauty state: tail-follow, spinner frame, frame-pacing key.
     let mut ans_pinned = true;
     let mut spin: usize = 0;
-    let mut last_key: Option<(String, usize, usize, usize, usize, bool, usize, usize, usize)> = None;
+    let mut last_key: Option<(String, usize, usize, usize, usize, bool, usize, usize, usize, bool)> = None;
     // Single source of geometry truth: the LAST DRAWN layout.
     // (list_y, list_h, scroll_x). Events map to pixels that exist.
     let mut geo: (usize, usize, usize) = (4, 20, 98);
@@ -490,15 +493,17 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             spin,
             kw,
             kh,
+            focused,
         );
         if last_key.as_ref() != Some(&key) {
             last_key = Some(key);
             let mut drawn_geo = (list_y, view_h, scroll_x);
             let _ = term.draw(|f| {
             let area = f.area();
+            let chrome = if focused { BORDER } else { Color::DarkGray };
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(BORDER))
+                .border_style(Style::default().fg(chrome))
                 .border_type(ratatui::widgets::BorderType::Rounded);
             let inner = block.inner(area);
             f.render_widget(block, area);
@@ -525,7 +530,9 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     .style(Style::default().fg(BORDER)),
                 rows[1],
             );
-            let header_txt = if answering {
+            let header_txt = if !focused && !answering {
+                "   ◌ sin foco — clic en el popup para enfocar".into()
+            } else if answering {
                 if ans_active.is_some() {
                     format!("   {} {} está respondiendo… (Enter copia y sale, Esc cierra)", SPIN[spin % SPIN.len()], ans_agent)
                 } else {
@@ -706,6 +713,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             }
         }
         match ev {
+            Event::FocusGained => focused = true,
+            Event::FocusLost => focused = false,
             Event::Key(k) => match (k.code, k.modifiers) {
             (KeyCode::Esc, _) => {
                 kill_answer(&mut ans_child);
@@ -880,6 +889,7 @@ impl Drop for AltGuard {
     fn drop(&mut self) {
         use crossterm::ExecutableCommand;
         let _ = io::stderr().execute(crossterm::event::DisableMouseCapture);
+        let _ = io::stderr().execute(crossterm::event::DisableFocusChange);
         let _ = crossterm::terminal::disable_raw_mode();
         let _ = io::stderr().execute(crossterm::terminal::LeaveAlternateScreen);
         let _ = io::stderr().execute(crossterm::cursor::Show);
