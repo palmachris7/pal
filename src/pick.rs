@@ -1255,6 +1255,18 @@ mod tests {
     }
 
     #[test]
+    fn skim_operators_work() {
+        // ^prefix, 'substring, !inverse: same language as skim/fzf.
+        let e = vec![
+            "/b | yazi → fm".to_string(),
+            "/b | music-cli → mu".to_string(),
+        ];
+        assert_eq!(rank_pub(&e, "^/b"), vec![0, 1]);
+        assert!(rank_pub(&e, "'sic-cli").contains(&1));
+        assert!(rank_pub(&e, "!/b").is_empty());
+    }
+
+    #[test]
     fn match_indices_hit_display() {
         let pat = Pattern::parse("msc", CaseMatching::Smart, Normalization::Smart);
         let hits = match_indices("/bin | msc → music", &pat);
