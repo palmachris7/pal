@@ -516,8 +516,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     let mut pending: Option<Event> = None;
     let mut err_streak: usize = 0;
     let mut focused = true;
-    // Event ticker (diagnostic + life sign): last event glyph + count.
-    let mut ev_last: char = '·';
+    // Event count feeds pacing + journal (invisible diagnostics).
     let mut ev_count: u64 = 0;
     // Inline answer state (? / ?? questions).
     let mut ans_lines: Vec<String> = vec![];
@@ -755,8 +754,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 (None, rows[2])
             };
             let prompt_line = format!("   ⚡ {}", query);
-            let ans_flag = if answering { format!(" A{}", ans_lines.len()) } else { String::new() };
-            let status_line = format!("  {}/{} #{} o{} {}{}{} e{}", order.len(), entries.len(), cursor, offset, ev_last, ev_count, ans_flag, err_streak);
+            // Solo N/M visible (Raycast-style). El resto vive en el journal.
+            let status_line = format!("  {}/{}", order.len(), entries.len());
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(prompt_line.as_str(), Style::default().fg(PROMPT).add_modifier(Modifier::BOLD)),
@@ -981,24 +980,13 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             Event::FocusGained => {
                 focused = true;
                 ev_count += 1;
-                ev_last = 'F';
             }
             Event::FocusLost => {
                 focused = false;
                 ev_count += 1;
-                ev_last = 'f';
             }
             Event::Key(k) => {
                 ev_count += 1;
-                ev_last = match k.code {
-                    KeyCode::Up => '↑',
-                    KeyCode::Down => '↓',
-                    KeyCode::Enter => '⏎',
-                    KeyCode::Esc => '⎋',
-                    KeyCode::Backspace => '⌫',
-                    KeyCode::Char(c) => c,
-                    _ => '·',
-                };
                 match (k.code, k.modifiers) {
             (KeyCode::Esc, _) => {
                 kill_answer(&mut ans_child);
@@ -1086,14 +1074,6 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             },
             Event::Mouse(m) => {
                 ev_count += 1;
-                ev_last = match m.kind {
-                    MouseEventKind::ScrollUp => '▲',
-                    MouseEventKind::ScrollDown => '▼',
-                    MouseEventKind::Down(_) => '●',
-                    MouseEventKind::Drag(_) => '◎',
-                    MouseEventKind::Up(_) => '○',
-                    _ => '·',
-                };
                 let max_cur = order.len().saturating_sub(1);
                 // Answer mode scrolls ans_lines with the same scrollbar math.
                 let (sb_total, sb_off) = if answering { (ans_lines.len(), ans_scroll) } else { (order.len(), offset) };
@@ -1191,17 +1171,14 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     }
                     _ => {
                         ev_count += 1;
-                        ev_last = '?';
-                    }
+                            }
                 }
             }
             Event::Resize(_, _) => {
                 ev_count += 1;
-                ev_last = 'R';
             }
             Event::Paste(_) => {
                 ev_count += 1;
-                ev_last = 'P';
             }
         }
     }
