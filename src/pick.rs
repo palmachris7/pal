@@ -192,6 +192,30 @@ impl Journal {
     }
 }
 
+/// Char-index line editing for the query (←/→ caret, insert in middle).
+fn qlen(s: &str) -> usize {
+    s.chars().count()
+}
+
+fn insert_at(s: &mut String, pos: usize, ch: char) -> usize {
+    let mut v: Vec<char> = s.chars().collect();
+    let p = pos.min(v.len());
+    v.insert(p, ch);
+    *s = v.into_iter().collect();
+    p + 1
+}
+
+fn remove_before(s: &mut String, pos: usize) -> usize {
+    let mut v: Vec<char> = s.chars().collect();
+    if pos == 0 || v.is_empty() {
+        return 0;
+    }
+    let p = pos.min(v.len());
+    v.remove(p - 1);
+    *s = v.into_iter().collect();
+    p - 1
+}
+
 /// `?pregunta` / `??idea` → (opencode, texto). None = not a question.
 // TODO: multi-agent config; por ahora todo es opencode.
 fn is_question(q: &str) -> Option<(&'static str, String)> {
@@ -483,6 +507,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
         let _ = io::stderr().execute(crossterm::event::EnableFocusChange);
     }
     let mut query = String::new();
+    let mut qpos: usize = 0;
     let mut cursor: usize = 0;
     let mut offset: usize = 0;
     let mut drag_grab: Option<usize> = None;
@@ -861,7 +886,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                         .set_fg(if is_thumb { Color::White } else { BORDER });
                 }
             }
-            f.set_cursor_position((rows[0].x + cell_w(&format!("   ⚡ {}", query)), rows[0].y));
+            let caret: String = query.chars().take(qpos).collect();
+            f.set_cursor_position((rows[0].x + cell_w("   ⚡ ") + cell_w(&caret), rows[0].y));
             });
             geo = drawn_geo;
         }
@@ -1007,7 +1033,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 }
             }
             (KeyCode::Backspace, _) => {
-                query.pop();
+                qpos = remove_before(&mut query, qpos);
                 cursor = 0;
                 drag_grab = None;
                 reset_answer(&mut ans_child, &mut ans_active);
@@ -1033,8 +1059,20 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     cursor += 1;
                 }
             }
+            (KeyCode::Left, _) | (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                qpos = qpos.saturating_sub(1);
+            }
+            (KeyCode::Right, _) | (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                qpos = (qpos + 1).min(qlen(&query));
+            }
+            (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+                qpos = 0;
+            }
+            (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+                qpos = qlen(&query);
+            }
             (KeyCode::Char(ch), KeyModifiers::NONE) | (KeyCode::Char(ch), KeyModifiers::SHIFT) => {
-                query.push(ch);
+                qpos = insert_at(&mut query, qpos, ch);
                 cursor = 0;
                 drag_grab = None;
                 reset_answer(&mut ans_child, &mut ans_active);
@@ -1269,6 +1307,21 @@ mod tests {
         assert!(is_shell(">  ").is_none());
         assert!(is_shell("yazi").is_none());
         assert!(is_shell("a > b").is_none());
+    }
+
+    #[test]
+    fn line_editing() {
+        let mut s = String::new();
+        let mut p = insert_at(&mut s, 0, 'a');
+        p = insert_at(&mut s, p, 'c');
+        assert_eq!(s, "ac");
+        p = insert_at(&mut s, 1, 'b');
+        assert_eq!((s.as_str(), p), ("abc", 2));
+        p = remove_before(&mut s, p);
+        assert_eq!((s.as_str(), p), ("ac", 1));
+        p = remove_before(&mut s, 0);
+        assert_eq!((s.as_str(), p), ("ac", 0));
+        assert_eq!(qlen("a→b"), 3);
     }
 
     #[test]
