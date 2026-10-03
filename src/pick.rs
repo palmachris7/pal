@@ -213,6 +213,15 @@ fn is_question(q: &str) -> Option<(&'static str, String)> {
     None
 }
 
+/// `>comando` → shell inline. None = not a shell command.
+fn is_shell(q: &str) -> Option<String> {
+    let r = q.trim().strip_prefix('>')?.trim();
+    if r.is_empty() {
+        return None;
+    }
+    Some(r.to_string())
+}
+
 enum AnsEvt {
     Line(String),
     Done,
@@ -278,6 +287,12 @@ fn parse_json_line(line: &str) -> Parsed {
 
 fn kill_answer(child: &mut Option<Child>) {
     if let Some(mut c) = child.take() {
+        // Children run setsid'd in their own group: kill the whole tree
+        // (no orphans), then reap. Harmless for already-dead children.
+        #[cfg(unix)]
+        unsafe {
+            libc::killpg(c.id() as i32, libc::SIGKILL);
+        }
         let _ = c.kill();
         let _ = c.wait();
     }
@@ -328,6 +343,15 @@ fn spawn_answer(
         cmd.args(["run", "--format", "json", prompt]);
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
+    // Own process group so killpg() below only ever hits our subtree.
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt as _;
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
     let mut child = cmd.spawn().ok()?;
     let out = child.stdout.take()?;
     std::thread::spawn(move || {
@@ -339,6 +363,51 @@ fn spawn_answer(
         let _ = tx.send((generation, AnsEvt::Done));
     });
     Some(child)
+}
+
+/// Shell command inline (`>cmd`): stdout+stderr drained by two threads
+/// into the same channel (approximate interleaving, fine for display),
+/// own process group, exit code observed by the pump via try_wait.
+fn spawn_shell(
+    shell_cmd: &str,
+    generation: u64,
+    tx: std::sync::mpsc::Sender<(u64, AnsEvt)>,
+) -> Option<Child> {
+    let shell = std::env::var("PAL_SHELL").unwrap_or("sh".into());
+    let mut cmd = Command::new(shell);
+    cmd.arg("-c").arg(shell_cmd);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt as _;
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().ok()?;
+    let out = child.stdout.take()?;
+    let err = child.stderr.take()?;
+    pipe_lines(BufReader::new(out), generation, tx.clone());
+    pipe_lines(BufReader::new(err), generation, tx);
+    Some(child)
+}
+
+fn pipe_lines<R: BufRead + Send + 'static>(
+    r: R,
+    generation: u64,
+    tx: std::sync::mpsc::Sender<(u64, AnsEvt)>,
+) {
+    std::thread::spawn(move || {
+        for line in r.lines().map_while(Result::ok) {
+            if tx.send((generation, AnsEvt::Line(line))).is_err() {
+                break;
+            }
+        }
+        // EOF on our stream. The pump finalizes only if the child
+        // actually exited (try_wait); otherwise it keeps waiting.
+        let _ = tx.send((generation, AnsEvt::Done));
+    });
 }
 
 #[cfg(test)]
@@ -416,6 +485,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     let mut ans_agent: &'static str = "opencode";
     let mut ans_last_q = String::new();
     let mut ans_session: Option<String> = None;
+    let mut ans_shell = false;
+    let mut ans_exit: Option<i32> = None;
     let mut last_type = Instant::now();
     // Beauty state: tail-follow, spinner frame, frame-pacing key.
     let mut ans_pinned = true;
@@ -446,7 +517,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
         if cursor >= order.len() && !order.is_empty() {
             cursor = order.len() - 1;
         }
-        // Pump streamed answer events (ignore stale generations).
+        // Pump streamed events (ignore stale generations).
+        // Shell lines are raw text; agent lines are opencode JSONL.
         if let Some(rx) = &ans_rx {
             while let Ok((g, m)) = rx.try_recv() {
                 if Some(g) != ans_active {
@@ -454,32 +526,55 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 }
                 match m {
                     AnsEvt::Line(l) => {
-                        let p = parse_json_line(&l);
-                        if let Some(s) = p.session {
-                            ans_session = Some(s);
-                        }
-                        if let Some(e) = p.error {
-                            ans_lines.push(format!("⚠ {}", e.lines().next().unwrap_or("error")));
-                        }
-                        for t in p.texts {
-                            // Skip exact-duplicate consecutive blocks (re-emitted parts).
-                            let dup = ans_lines.last().is_some_and(|last| last == &t);
-                            if !dup {
-                                ans_lines.extend(t.lines().map(|s| s.to_string()));
+                        if ans_shell {
+                            ans_lines.push(l);
+                        } else {
+                            let p = parse_json_line(&l);
+                            if let Some(s) = p.session {
+                                ans_session = Some(s);
                             }
+                            if let Some(e) = p.error {
+                                ans_lines.push(format!("⚠ {}", e.lines().next().unwrap_or("error")));
+                            }
+                            for t in p.texts {
+                                // Skip exact-duplicate consecutive blocks (re-emitted parts).
+                                let dup = ans_lines.last().is_some_and(|last| last == &t);
+                                if !dup {
+                                    ans_lines.extend(t.lines().map(|s| s.to_string()));
+                                }
+                            }
+                        }
+                        // Cap: keep the tail (2000), adjust scroll.
+                        if ans_lines.len() > 2000 {
+                            let drop = ans_lines.len() - 2000;
+                            ans_lines.drain(..drop);
+                            ans_scroll = ans_scroll.saturating_sub(drop);
                         }
                     }
                     AnsEvt::Done => {
-                        ans_active = None;
-                        kill_answer(&mut ans_child);
+                        // One EOF is not death (two streams): finalize only
+                        // when the child really exited, else keep waiting.
+                        let dead = ans_child
+                            .as_mut()
+                            .map(|c| c.try_wait().ok().flatten().is_some())
+                            .unwrap_or(true);
+                        if dead {
+                            if let Some(c) = ans_child.as_mut() {
+                                if let Ok(Some(st)) = c.try_wait() {
+                                    ans_exit = st.code();
+                                }
+                            }
+                            ans_active = None;
+                            kill_answer(&mut ans_child);
+                        }
                     }
                 }
             }
         }
-        // Launch agent after 600ms idle on a real question.
-        // ans_last_q prevents relaunching after Done for the same text.
-        if let Some((agent, prompt)) = is_question(&query) {
-            ans_agent = agent;
+        // Launch agent/shell after 600ms idle. ans_last_q prevents
+        // relaunching after Done for the same text.
+        if let Some(prompt) = is_shell(&query) {
+            ans_shell = true;
             if ans_active.is_none() && query != ans_last_q && last_type.elapsed() > Duration::from_millis(600) {
                 ans_gen += 1;
                 let (tx, rx) = mpsc::channel();
@@ -488,6 +583,25 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 ans_scroll = 0;
                 ans_active = Some(ans_gen);
                 ans_last_q = query.clone();
+                ans_exit = None;
+                ans_child = spawn_shell(&prompt, ans_gen, tx);
+                if ans_child.is_none() {
+                    ans_active = None;
+                    ans_lines.push("(no se pudo lanzar el shell)".into());
+                }
+            }
+        } else if let Some((agent, prompt)) = is_question(&query) {
+            ans_agent = agent;
+            ans_shell = false;
+            if ans_active.is_none() && query != ans_last_q && last_type.elapsed() > Duration::from_millis(600) {
+                ans_gen += 1;
+                let (tx, rx) = mpsc::channel();
+                ans_rx = Some(rx);
+                ans_lines.clear();
+                ans_scroll = 0;
+                ans_active = Some(ans_gen);
+                ans_last_q = query.clone();
+                ans_exit = None;
                 ans_child = spawn_answer(agent, &prompt, ans_gen, ans_session.clone(), tx);
                 if ans_child.is_none() {
                     ans_active = None;
@@ -583,7 +697,17 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             let header_txt = if !focused && !answering {
                 "   ◌ sin foco — clic en el popup para enfocar".into()
             } else if answering {
-                if ans_active.is_some() {
+                if ans_shell {
+                    if ans_active.is_some() {
+                        format!("   {} ⚙ corriendo… (Enter copia y sale, Esc mata)", SPIN[spin % SPIN.len()])
+                    } else {
+                        match ans_exit {
+                            Some(0) => "   ✔ exit 0 — Enter copia y sale, Esc cierra".into(),
+                            Some(c) => format!("   ✘ exit {} — Enter copia y sale, Esc cierra", c),
+                            None => "   ⚙ terminado — Enter copia y sale, Esc cierra".into(),
+                        }
+                    }
+                } else if ans_active.is_some() {
                     format!("   {} {} está respondiendo… (Enter copia y sale, Esc cierra)", SPIN[spin % SPIN.len()], ans_agent)
                 } else {
                     format!("   ✦ respuesta de {} (Enter copia y sale, Esc cierra)", ans_agent)
@@ -799,9 +923,9 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             }
             (KeyCode::Enter, _) => {
                 kill_answer(&mut ans_child);
-                if is_question(&query).is_some() {
+                if is_question(&query).is_some() || is_shell(&query).is_some() {
                     if answering && !ans_lines.is_empty() {
-                        // Respuesta lista: copiar y salir sin ventana.
+                        // Respuesta/salida lista: copiar y salir sin ventana.
                         copy_answer(&ans_lines);
                         journal.line("exit enter-copy".into());
                         return Some((String::new(), None));
@@ -811,6 +935,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     ans_last_q = String::new();
                     ans_lines.clear();
                     ans_scroll = 0;
+                    ans_shell = false;
+                    ans_exit = None;
                     last_type = Instant::now() - Duration::from_secs(3600);
                 } else {
                     let sel = order.get(cursor).map(|&i| entries[i].clone());
@@ -823,6 +949,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 cursor = 0;
                 drag_grab = None;
                 reset_answer(&mut ans_child, &mut ans_active, &mut ans_lines, &mut ans_scroll);
+                ans_shell = false;
+                ans_exit = None;
                 ans_pinned = true;
                 last_click = None;
                 last_type = Instant::now();
@@ -849,6 +977,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 cursor = 0;
                 drag_grab = None;
                 reset_answer(&mut ans_child, &mut ans_active, &mut ans_lines, &mut ans_scroll);
+                ans_shell = false;
+                ans_exit = None;
                 ans_pinned = true;
                 last_click = None;
                 last_type = Instant::now();
@@ -1069,6 +1199,16 @@ mod tests {
         assert!(is_question("?  ").is_none());
         assert!(is_question("yazi").is_none());
         assert!(is_question("msc --help").is_none());
+    }
+
+    #[test]
+    fn shell_detect() {
+        assert_eq!(is_shell(">brew uninstall foo").as_deref(), Some("brew uninstall foo"));
+        assert_eq!(is_shell(">  ls -la  ").as_deref(), Some("ls -la"));
+        assert!(is_shell(">").is_none());
+        assert!(is_shell(">  ").is_none());
+        assert!(is_shell("yazi").is_none());
+        assert!(is_shell("a > b").is_none());
     }
 
     #[test]

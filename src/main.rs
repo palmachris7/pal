@@ -129,8 +129,8 @@ fn main() {
         return;
     }
     // Questions (? / ??) are answered inline by the picker (copy+dismiss).
-    // They never open a pane: opencode stays headless here.
-    if cmd.starts_with('?') {
+    // Shell runs (>cmd) too. They never open a pane.
+    if cmd.starts_with('?') || cmd.starts_with('>') {
         return;
     }
 
