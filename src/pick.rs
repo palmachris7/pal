@@ -20,7 +20,6 @@ use ratatui::{
 };
 use ratatui::backend::CrosstermBackend;
 use std::io;
-use unicode_width::UnicodeWidthStr;
 
 // Palette roles (one accent, nord soul):
 // BORDER = quiet chrome, FG = content, PROMPT = input voice,
@@ -36,53 +35,72 @@ const CODE: Color = Color::Indexed(180);
 
 const SPIN: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠿"];
 
+use unicode_segmentation::UnicodeSegmentation;
+
 fn cell_w(s: &str) -> u16 {
-    UnicodeWidthStr::width(s) as u16
+    gwidth(s) as u16
 }
 
-/// Elegant truncation: cut by cell width, end with … (never mid-word abrupt).
+/// Cell width, grapheme-correct (ZWJ clusters count once, combining marks zero).
+fn gwidth(s: &str) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    s.graphemes(true)
+        .map(|g| {
+            g.chars()
+                .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                .max()
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+/// Elegant truncation: cut by cell width on grapheme boundaries, end with ….
 fn fit(s: &str, max_w: usize) -> String {
-    if UnicodeWidthStr::width(s) <= max_w {
+    if gwidth(s) <= max_w {
         return s.to_string();
     }
     let mut w = 0;
     let mut out = String::new();
-    for c in s.chars() {
-        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+    for g in s.graphemes(true) {
+        let cw = gwidth(g);
         if w + cw + 1 > max_w {
             break;
         }
-        out.push(c);
+        out.push_str(g);
         w += cw;
     }
     out.push('…');
     out
 }
 
-/// (display_text, char_offset_of_display_within_entry).
+/// (display_text, GRAPHEME offset_of_display_within_entry).
+/// Offsets are grapheme counts: nucleo reports grapheme indices.
 fn display_span(entry: &str) -> (String, usize) {
     let Some(pos) = entry.find('|') else {
         return (entry.to_string(), 0);
     };
-    let pre: usize = entry[..pos].chars().count() + 1;
+    let pre: usize = entry[..pos].graphemes(true).count() + 1;
     let rest = &entry[pos + 1..];
-    let lead: usize = rest.chars().take_while(|c| c.is_whitespace()).count();
+    let lead: usize = rest
+        .graphemes(true)
+        .take_while(|g| g.chars().all(|c| c.is_whitespace()))
+        .count();
     (rest.trim().to_string(), pre + lead)
 }
 
-/// Per-char highlight spans for matched indices (char positions in `text`).
+/// Per-graphene highlight spans for matched indices (grapheme positions).
 fn hl_spans(text: &str, hits: &[u32], base: Style, hl: Style) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     let mut cur: Option<(bool, String)> = None;
-    for (i, c) in text.chars().enumerate() {
+    for (i, g) in text.graphemes(true).enumerate() {
         let hit = hits.contains(&(i as u32));
         match &mut cur {
-            Some((h, s)) if *h == hit => s.push(c),
+            Some((h, s)) if *h == hit => s.push_str(g),
             _ => {
                 if let Some((h, s)) = cur.take() {
                     out.push(Span::styled(s, if h { hl } else { base }));
                 }
-                cur = Some((hit, c.to_string()));
+                cur = Some((hit, g.to_string()));
             }
         }
     }
@@ -192,27 +210,42 @@ impl Journal {
     }
 }
 
-/// Char-index line editing for the query (←/→ caret, insert in middle).
+/// Grapheme-index line editing for the query (←/→ caret, insert in middle).
+/// Positions count graphemes, so ZWJ clusters never split.
 fn qlen(s: &str) -> usize {
-    s.chars().count()
+    s.graphemes(true).count()
 }
 
 fn insert_at(s: &mut String, pos: usize, ch: char) -> usize {
-    let mut v: Vec<char> = s.chars().collect();
+    let v: Vec<&str> = s.graphemes(true).collect();
     let p = pos.min(v.len());
-    v.insert(p, ch);
-    *s = v.into_iter().collect();
+    let mut out = String::new();
+    for (i, g) in v.iter().enumerate() {
+        if i == p {
+            out.push(ch);
+        }
+        out.push_str(g);
+    }
+    if p == v.len() {
+        out.push(ch);
+    }
+    *s = out;
     p + 1
 }
 
 fn remove_before(s: &mut String, pos: usize) -> usize {
-    let mut v: Vec<char> = s.chars().collect();
+    let v: Vec<&str> = s.graphemes(true).collect();
     if pos == 0 || v.is_empty() {
         return 0;
     }
     let p = pos.min(v.len());
-    v.remove(p - 1);
-    *s = v.into_iter().collect();
+    let mut out = String::new();
+    for (i, g) in v.iter().enumerate() {
+        if i != p - 1 {
+            out.push_str(g);
+        }
+    }
+    *s = out;
     p - 1
 }
 
@@ -487,7 +520,7 @@ fn match_indices(entry: &str, pat: &Pattern) -> Vec<u32> {
     }
     idx.sort_unstable();
     idx.dedup();
-    let n = text.chars().count() as u32;
+    let n = text.graphemes(true).count() as u32;
     idx.into_iter()
         .filter_map(|i| i.checked_sub(off as u32))
         .filter(|i| *i < n)
@@ -851,7 +884,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                         ]))
                     } else {
                         let hits = match_indices(&entries[ei], pat.as_ref().unwrap());
-                        let n = fitted.chars().count() as u32;
+                        let n = fitted.graphemes(true).count() as u32;
                         let hits: Vec<u32> = hits.into_iter().filter(|i| *i < n).collect();
                         let mut spans = vec![Span::raw(" "), Span::styled("▌", mark_style), Span::raw("  ")];
                         spans.extend(hl_spans(
@@ -885,7 +918,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                         .set_fg(if is_thumb { Color::White } else { BORDER });
                 }
             }
-            let caret: String = query.chars().take(qpos).collect();
+            let caret: String = query.graphemes(true).take(qpos).collect::<Vec<&str>>().concat();
             f.set_cursor_position((rows[0].x + cell_w("   ⚡ ") + cell_w(&caret), rows[0].y));
             });
             geo = drawn_geo;
@@ -1311,6 +1344,27 @@ mod tests {
         p = remove_before(&mut s, 0);
         assert_eq!((s.as_str(), p), ("ac", 0));
         assert_eq!(qlen("a→b"), 3);
+    }
+
+    #[test]
+    fn graphemes_stay_whole() {
+        let fam = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"; // 👨‍👩‍👧, one cluster
+        assert_eq!(qlen(fam), 1);
+        assert_eq!(gwidth(fam), 2);
+        assert_eq!(cell_w(fam), 2);
+        // Combining mark joins its base (e + ́ = one grapheme).
+        assert_eq!(qlen("e\u{301}"), 1);
+        // Insert/remove move whole graphemes, never split clusters.
+        let mut s = "a".to_string();
+        let p = insert_at(&mut s, 1, '👨');
+        assert_eq!(p, 2);
+        assert_eq!(qlen(&s), 2);
+        let p = remove_before(&mut s, p);
+        assert_eq!((s.as_str(), p), ("a", 1));
+        // fit() never cuts inside a cluster: ends with … on a boundary.
+        let cut = fit(&format!("ab{}cd", fam), 5);
+        assert!(cut.ends_with('…'));
+        assert_eq!(cut.graphemes(true).count(), 4); // a b fam …
     }
 
     #[test]
