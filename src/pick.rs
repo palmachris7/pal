@@ -617,7 +617,9 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 .enumerate()
                 .skip(offset)
                 .take(drawn_h)                .map(|(vi, &ei)| {
-                    let selected = (offset + vi) == cursor;
+                    // vi already counts from 0 of `order` (skip doesn't
+                    // renumber), so it compares straight against cursor.
+                    let selected = vi == cursor;
                     let mark_style = if selected {
                         Style::default().fg(MARK).bg(Color::Black).add_modifier(Modifier::BOLD)
                     } else {
