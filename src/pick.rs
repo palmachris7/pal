@@ -368,14 +368,21 @@ fn spawn_answer(
 /// Shell command inline (`>cmd`): stdout+stderr drained by two threads
 /// into the same channel (approximate interleaving, fine for display),
 /// own process group, exit code observed by the pump via try_wait.
+///
+/// Runs under YOUR shell (zsh -i): aliases and functions from ~/.zshrc
+/// work like in a pane. PAL_SHELL overrides ("sh" for plain POSIX).
+/// Filters zshrc init noise lines like `(eval):1: ...`.
 fn spawn_shell(
     shell_cmd: &str,
     generation: u64,
     tx: std::sync::mpsc::Sender<(u64, AnsEvt)>,
 ) -> Option<Child> {
-    let shell = std::env::var("PAL_SHELL").unwrap_or("sh".into());
-    let mut cmd = Command::new(shell);
-    cmd.arg("-c").arg(shell_cmd);
+    let (bin, args): (String, Vec<&str>) = match std::env::var("PAL_SHELL") {
+        Ok(s) => (s, vec!["-c"]),
+        Err(_) => ("zsh".into(), vec!["-i", "-c"]),
+    };
+    let mut cmd = Command::new(bin);
+    cmd.args(args).arg(shell_cmd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
     #[cfg(unix)]
     unsafe {
@@ -527,7 +534,10 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 match m {
                     AnsEvt::Line(l) => {
                         if ans_shell {
-                            ans_lines.push(l);
+                            // Drop zshrc init noise (`(eval):1: ...`), keep real output.
+                            if !l.starts_with("(eval)") {
+                                ans_lines.push(l);
+                            }
                         } else {
                             let p = parse_json_line(&l);
                             if let Some(s) = p.session {
