@@ -680,15 +680,31 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 .border_type(ratatui::widgets::BorderType::Rounded);
             let inner = block.inner(area);
             f.render_widget(block, area);
+            // Header row only when it carries live state (answering,
+            // unfocused). Otherwise the list takes that row.
+            let show_header = answering || !focused;
             let rows = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Min(1),
-                ])
+                .constraints(if show_header {
+                    vec![
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Min(1),
+                    ]
+                } else {
+                    vec![
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Min(1),
+                    ]
+                })
                 .split(inner);
+            let (header_row, list_row) = if show_header {
+                (Some(rows[2]), rows[3])
+            } else {
+                (None, rows[2])
+            };
             let prompt_line = format!("   ⚡ {}", query);
             let ans_flag = if answering { format!(" A{}", ans_lines.len()) } else { String::new() };
             let status_line = format!("  {}/{} #{} o{} {}{}{} e{}", order.len(), entries.len(), cursor, offset, ev_last, ev_count, ans_flag, err_streak);
@@ -725,20 +741,22 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             } else {
                 "   Escribe para buscar o ejecutar (Enter = correr lo escrito)".into()
             };
-            f.render_widget(
-                Paragraph::new(header_txt)
-                    .style(Style::default().fg(HEADER)),
-                rows[2],
-            );
+            if let Some(hr) = header_row {
+                f.render_widget(
+                    Paragraph::new(header_txt)
+                        .style(Style::default().fg(HEADER)),
+                    hr,
+                );
+            }
             // Content width: indent + 1 column reserved for scrollbar.
             // drawn_h is the REAL list height (layout truth, not term.size).
-            let drawn_h = (rows[3].height as usize).max(1);
+            let drawn_h = (list_row.height as usize).max(1);
             drawn_geo = (
-                rows[3].y as usize,
+                list_row.y as usize,
                 drawn_h,
-                rows[3].right().saturating_sub(1) as usize,
+                list_row.right().saturating_sub(1) as usize,
             );
-            let content_w = (rows[3].width as usize).saturating_sub(1);
+            let content_w = (list_row.width as usize).saturating_sub(1);
             let items: Vec<ListItem> = if answering {
                 ans_lines
                     .iter()
@@ -788,12 +806,12 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 })
                 .collect()
             };
-            f.render_widget(List::new(items), rows[3]);
+            f.render_widget(List::new(items), list_row);
             // Scrollbar (fzf style): dim track + bright thumb on last column.
             // In answer mode it follows ans_scroll over the answer lines.
             let (sb_total, sb_off) = if answering { (ans_lines.len(), ans_scroll) } else { (order.len(), offset) };
             if sb_total > drawn_h {
-                let list_area = rows[3];
+                let list_area = list_row;
                 let sx = list_area.right().saturating_sub(1);
                 let (start, th) = thumb(drawn_h, sb_total, sb_off);
                 let buf = f.buffer_mut();
