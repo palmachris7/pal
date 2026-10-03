@@ -222,6 +222,23 @@ fn is_shell(q: &str) -> Option<String> {
     Some(r.to_string())
 }
 
+/// Conversation block marker: user questions/commands in the transcript.
+const QBLOCK: &str = "❯ ";
+
+/// Last assistant answer in the transcript (lines after the final ❯ block).
+/// Empty while the current turn is still thinking.
+fn last_answer(lines: &[String]) -> Vec<String> {
+    let mut out = vec![];
+    for l in lines.iter().rev() {
+        if l.starts_with(QBLOCK) {
+            break;
+        }
+        out.push(l.clone());
+    }
+    out.reverse();
+    out
+}
+
 enum AnsEvt {
     Line(String),
     Done,
@@ -313,16 +330,11 @@ fn copy_answer(lines: &[String]) {
     }
 }
 
-fn reset_answer(
-    child: &mut Option<Child>,
-    active: &mut Option<u64>,
-    lines: &mut Vec<String>,
-    scroll: &mut usize,
-) {
+fn reset_answer(child: &mut Option<Child>, active: &mut Option<u64>) {
+    // Conversation transcripts survive edits: only stop the live run.
+    // Scroll position and history are kept (reader-friendly).
     kill_answer(child);
     *active = None;
-    lines.clear();
-    *scroll = 0;
 }
 
 fn spawn_answer(
@@ -582,18 +594,19 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             }
         }
         // Launch agent/shell after 600ms idle. ans_last_q prevents
-        // relaunching after Done for the same text.
+        // relaunching after Done for the same text. New turns APPEND
+        // a ❯ block to the transcript (conversation, never cleared).
         if let Some(prompt) = is_shell(&query) {
             ans_shell = true;
             if ans_active.is_none() && query != ans_last_q && last_type.elapsed() > Duration::from_millis(600) {
                 ans_gen += 1;
                 let (tx, rx) = mpsc::channel();
                 ans_rx = Some(rx);
-                ans_lines.clear();
-                ans_scroll = 0;
                 ans_active = Some(ans_gen);
                 ans_last_q = query.clone();
                 ans_exit = None;
+                ans_pinned = true;
+                ans_lines.push(format!("{}{}", QBLOCK, prompt));
                 ans_child = spawn_shell(&prompt, ans_gen, tx);
                 if ans_child.is_none() {
                     ans_active = None;
@@ -607,11 +620,11 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 ans_gen += 1;
                 let (tx, rx) = mpsc::channel();
                 ans_rx = Some(rx);
-                ans_lines.clear();
-                ans_scroll = 0;
                 ans_active = Some(ans_gen);
                 ans_last_q = query.clone();
                 ans_exit = None;
+                ans_pinned = true;
+                ans_lines.push(format!("{}{}", QBLOCK, prompt));
                 ans_child = spawn_answer(agent, &prompt, ans_gen, ans_session.clone(), tx);
                 if ans_child.is_none() {
                     ans_active = None;
@@ -619,7 +632,10 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 }
             }
         }
-        let answering = ans_active.is_some() || !ans_lines.is_empty();
+        // Answer view shows while a run is live, or while the query is a
+        // question/shell with transcript history. Plain queries show entries.
+        let in_ask = is_shell(&query).is_some() || is_question(&query).is_some();
+        let answering = ans_active.is_some() || (in_ask && !ans_lines.is_empty());
         // Geometry comes from the last drawn frame (never recomputed from
         // term.size here): clicks and follow map to pixels that exist.
         let list_y = geo.0;
@@ -762,7 +778,18 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     .iter()
                     .skip(ans_scroll)
                     .take(drawn_h)
-                    .map(|l| ListItem::new(Line::from(md_spans(&fit(l, content_w.saturating_sub(2)), Style::default().fg(FG)))))
+                    .map(|l| {
+                        let fitted = fit(l, content_w.saturating_sub(2));
+                        if fitted.starts_with(QBLOCK) {
+                            // User turn: accent voice, stands out in history.
+                            ListItem::new(Line::from(vec![Span::styled(
+                                format!("  {}", fitted),
+                                Style::default().fg(MARK).add_modifier(Modifier::BOLD),
+                            )]))
+                        } else {
+                            ListItem::new(Line::from(md_spans(&fitted, Style::default().fg(FG))))
+                        }
+                    })
                     .collect()
             } else { order
                 .iter()
@@ -951,18 +978,17 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             }
             (KeyCode::Enter, _) => {
                 kill_answer(&mut ans_child);
-                if is_question(&query).is_some() || is_shell(&query).is_some() {
-                    if answering && !ans_lines.is_empty() {
-                        // Respuesta/salida lista: copiar y salir sin ventana.
-                        copy_answer(&ans_lines);
+                if in_ask || answering {
+                    // Conversación: copiar la ÚLTIMA respuesta y salir.
+                    // Sin respuesta aún (Enter rápido): lanzar ya y quedarse.
+                    let la = last_answer(&ans_lines);
+                    if !la.is_empty() {
+                        copy_answer(&la);
                         journal.line("exit enter-copy".into());
                         return Some((String::new(), None));
                     }
-                    // Sin respuesta aún (Enter rápido): lanzar ya y quedarse.
                     ans_active = None;
                     ans_last_q = String::new();
-                    ans_lines.clear();
-                    ans_scroll = 0;
                     ans_shell = false;
                     ans_exit = None;
                     last_type = Instant::now() - Duration::from_secs(3600);
@@ -976,10 +1002,9 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 query.pop();
                 cursor = 0;
                 drag_grab = None;
-                reset_answer(&mut ans_child, &mut ans_active, &mut ans_lines, &mut ans_scroll);
+                reset_answer(&mut ans_child, &mut ans_active);
                 ans_shell = false;
                 ans_exit = None;
-                ans_pinned = true;
                 last_click = None;
                 last_type = Instant::now();
             }
@@ -1004,10 +1029,9 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 query.push(ch);
                 cursor = 0;
                 drag_grab = None;
-                reset_answer(&mut ans_child, &mut ans_active, &mut ans_lines, &mut ans_scroll);
+                reset_answer(&mut ans_child, &mut ans_active);
                 ans_shell = false;
                 ans_exit = None;
-                ans_pinned = true;
                 last_click = None;
                 last_type = Instant::now();
             }
@@ -1237,6 +1261,20 @@ mod tests {
         assert!(is_shell(">  ").is_none());
         assert!(is_shell("yazi").is_none());
         assert!(is_shell("a > b").is_none());
+    }
+
+    #[test]
+    fn last_answer_takes_final_turn() {
+        let lines = vec![
+            "❯ primera".to_string(),
+            "resp 1".to_string(),
+            "❯ segunda".to_string(),
+            "resp 2a".to_string(),
+            "resp 2b".to_string(),
+        ];
+        assert_eq!(last_answer(&lines), vec!["resp 2a", "resp 2b"]);
+        assert!(last_answer(&["❯ pensando".to_string()]).is_empty());
+        assert!(last_answer(&[]).is_empty());
     }
 
     #[test]
