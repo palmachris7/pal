@@ -606,7 +606,11 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 ans_last_q = query.clone();
                 ans_exit = None;
                 ans_pinned = true;
-                ans_lines.push(format!("{}{}", QBLOCK, prompt));
+                // Never duplicate the Q block (Enter-happy safe).
+                let qline = format!("{}{}", QBLOCK, prompt);
+                if ans_lines.last().map(|l| l != &qline).unwrap_or(true) {
+                    ans_lines.push(qline);
+                }
                 ans_child = spawn_shell(&prompt, ans_gen, tx);
                 if ans_child.is_none() {
                     ans_active = None;
@@ -624,7 +628,11 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 ans_last_q = query.clone();
                 ans_exit = None;
                 ans_pinned = true;
-                ans_lines.push(format!("{}{}", QBLOCK, prompt));
+                // Never duplicate the Q block (Enter-happy safe).
+                let qline = format!("{}{}", QBLOCK, prompt);
+                if ans_lines.last().map(|l| l != &qline).unwrap_or(true) {
+                    ans_lines.push(qline);
+                }
                 ans_child = spawn_answer(agent, &prompt, ans_gen, ans_session.clone(), tx);
                 if ans_child.is_none() {
                     ans_active = None;
@@ -977,21 +985,21 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 return None;
             }
             (KeyCode::Enter, _) => {
-                kill_answer(&mut ans_child);
                 if in_ask || answering {
-                    // Conversación: copiar la ÚLTIMA respuesta y salir.
-                    // Sin respuesta aún (Enter rápido): lanzar ya y quedarse.
+                    // Idempotente: con respuesta → copiar y salir.
+                    // Pensando → quedarse quieto (no matar, no relanzar).
+                    // Nunca lanzado → lanzar ya y quedarse.
                     let la = last_answer(&ans_lines);
                     if !la.is_empty() {
+                        kill_answer(&mut ans_child);
                         copy_answer(&la);
                         journal.line("exit enter-copy".into());
                         return Some((String::new(), None));
                     }
-                    ans_active = None;
-                    ans_last_q = String::new();
-                    ans_shell = false;
-                    ans_exit = None;
-                    last_type = Instant::now() - Duration::from_secs(3600);
+                    if ans_active.is_none() {
+                        ans_last_q = String::new();
+                        last_type = Instant::now() - Duration::from_secs(3600);
+                    }
                 } else {
                     let sel = order.get(cursor).map(|&i| entries[i].clone());
                     journal.line(format!("exit enter sel={}", sel.is_some() as u8));
