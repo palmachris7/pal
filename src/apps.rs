@@ -7,6 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 
 const DEFAULT_APPS: &str = r#"# pal_smart — interactive terminal applications
 # Format: command → description
@@ -109,8 +111,44 @@ fn refresh_brew_cache(cache: &Path) {
     }
 }
 
+// Cached PATH scan with mtime-based invalidation.
+static PATH_SCAN_CACHE: OnceLock<Mutex<Option<(Vec<String>, SystemTime)>>> = OnceLock::new();
+
 fn history_path(dir: &Path) -> PathBuf {
     dir.join("history")
+}
+
+fn scan_path_cached() -> Vec<String> {
+    let cache = PATH_SCAN_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().unwrap();
+    let now = SystemTime::now();
+    // Re-scan if cache older than 5 minutes or empty.
+    if let Some((ref cmds, ref ts)) = *guard {
+        if now.duration_since(*ts).unwrap_or(Duration::MAX) < Duration::from_secs(300) {
+            return cmds.clone();
+        }
+    }
+    // Scan PATH directories.
+    let mut cmds = Vec::new();
+    let mut seen = HashSet::new();
+    if let Ok(path_var) = env::var("PATH") {
+        for d in path_var.split(':') {
+            if let Ok(rd) = fs::read_dir(d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if !is_executable(&p) { continue; }
+                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                        if seen.insert(name.to_string()) {
+                            cmds.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    cmds.sort();
+    *guard = Some((cmds.clone(), now));
+    cmds
 }
 
 /// Frecency top-20 from history (count desc), like the zsh pipeline.
@@ -176,7 +214,8 @@ fn label(cmd: &str, desc: &HashMap<String, String>, star: bool) -> String {
 pub fn entries(dir: &Path) -> Vec<String> {
     let apps_txt = ensure_apps_txt(dir);
     let mut desc = load_descs(&apps_txt);
-    brew_descs(dir, &mut desc);
+    // Load cached brew descriptions immediately (never blocks).
+    load_brew_descs_cached(dir, &mut desc);
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = vec![];
@@ -186,66 +225,23 @@ pub fn entries(dir: &Path) -> Vec<String> {
         if seen.contains(&cmd) {
             continue;
         }
-        let found = env::var("PATH")
-            .unwrap_or_default()
-            .split(':')
-            .any(|d| is_executable(&PathBuf::from(d).join(&cmd)));
-        if !found {
+        // Use cached PATH scan to verify existence.
+        if !scan_path_cached().contains(&cmd) {
             continue;
         }
         seen.insert(cmd.clone());
         freq_cmds.push(cmd.clone());
     }
 
-    let mut path_cmds: Vec<String> = vec![];
-    for d in env::var("PATH").unwrap_or_default().split(':') {
-        let Ok(rd) = fs::read_dir(d) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            let p = e.path();
-            if !is_executable(&p) {
-                continue;
-            }
-            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if !seen.contains(name) {
-                    seen.insert(name.to_string());
-                    path_cmds.push(name.to_string());
-                }
-            }
-        }
-    }
-    path_cmds.sort();
-    // Miss directo: lo no cacheado se pide a brew una vez y se guarda.
-    // (ponytail: cubre installs nuevos sin esperar las 24h del caché.)
-    let missing: Vec<&str> = freq_cmds.iter().chain(path_cmds.iter()).map(|s| s.as_str())
-        .filter(|c| !desc.contains_key(*c)).collect();
-    if !missing.is_empty() {
-        let mut cmd = Command::new("brew");
-        cmd.arg("desc");
-        for m in &missing { cmd.arg(m); }
-        if let Ok(o) = cmd.output() {
-            let text = String::from_utf8_lossy(&o.stdout).into_owned();
-            let mut fresh = vec![];
-            for line in text.lines() {
-                if let Some((k, v)) = line.split_once(':') {
-                    let (k, v) = (trim(k), trim(v.trim_start_matches(' ')));
-                    if !k.is_empty() && !v.is_empty() {
-                        desc.insert(k.to_string(), v.to_string());
-                        fresh.push(line.to_string());
-                    }
-                }
-            }
-            if !fresh.is_empty() {
-                let cache = dir.join("brew-desc.txt");
-                let mut all = fs::read_to_string(&cache).unwrap_or_default();
-                if !all.is_empty() && !all.ends_with('\n') { all.push('\n'); }
-                all.push_str(&fresh.join("\n"));
-                all.push('\n');
-                let _ = fs::write(&cache, all);
-            }
-        }
-    }
+    // Use cached PATH scan instead of re-scanning.
+    let path_cmds: Vec<String> = scan_path_cached()
+        .into_iter()
+        .filter(|name| !seen.contains(name))
+        .collect();
+
+    // Schedule missing brew descs in background (never blocks UI).
+    schedule_missing_brew_descs(dir, &freq_cmds, &path_cmds, &desc);
+
     for cmd in &freq_cmds {
         out.push(label(cmd, &desc, true));
     }
@@ -253,4 +249,54 @@ pub fn entries(dir: &Path) -> Vec<String> {
         out.push(label(&cmd, &desc, false));
     }
     out
+}
+
+// Load brew descriptions from cache only (no network).
+fn load_brew_descs_cached(dir: &Path, desc: &mut HashMap<String, String>) {
+    let cache = dir.join("brew-desc.txt");
+    let Ok(text) = fs::read_to_string(&cache) else { return; };
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once(':') else { continue; };
+        let (k, v) = (trim(k), trim(v.trim_start_matches(' ')));
+        if k.is_empty() || v.is_empty() || desc.contains_key(&k) { continue; }
+        desc.insert(k, v);
+    }
+}
+
+// Schedule missing brew descs in background.
+fn schedule_missing_brew_descs(dir: &Path, freq: &[String], path: &[String], existing: &HashMap<String, String>) {
+    let missing: Vec<String> = freq.iter().chain(path.iter())
+        .filter(|c| !existing.contains_key(*c))
+        .cloned()
+        .collect();
+    if missing.is_empty() { return; }
+
+    let cache = dir.join("brew-desc.txt");
+    let missing_arc = Arc::new(missing);
+    let cache_arc = Arc::new(cache);
+
+    thread::spawn(move || {
+        let mut cmd = Command::new("brew");
+        cmd.arg("desc");
+        for m in missing_arc.iter() { cmd.arg(m); }
+        if let Ok(o) = cmd.output() {
+            let text = String::from_utf8_lossy(&o.stdout).into_owned();
+            let mut fresh = vec![];
+            for line in text.lines() {
+                if let Some((k, v)) = line.split_once(':') {
+                    let (k, v) = (trim(k), trim(v.trim_start_matches(' ')));
+                    if !k.is_empty() && !v.is_empty() {
+                        fresh.push(line.to_string());
+                    }
+                }
+            }
+            if !fresh.is_empty() {
+                let mut all = fs::read_to_string(&*cache_arc).unwrap_or_default();
+                if !all.is_empty() && !all.ends_with('\n') { all.push('\n'); }
+                all.push_str(&fresh.join("\n"));
+                all.push('\n');
+                let _ = fs::write(&*cache_arc, all);
+            }
+        }
+    });
 }
