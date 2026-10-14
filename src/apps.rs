@@ -180,6 +180,7 @@ pub fn entries(dir: &Path) -> Vec<String> {
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = vec![];
+    let mut freq_cmds: Vec<String> = vec![];
 
     for cmd in frequent(dir) {
         if seen.contains(&cmd) {
@@ -193,7 +194,7 @@ pub fn entries(dir: &Path) -> Vec<String> {
             continue;
         }
         seen.insert(cmd.clone());
-        out.push(label(&cmd, &desc, true));
+        freq_cmds.push(cmd.clone());
     }
 
     let mut path_cmds: Vec<String> = vec![];
@@ -215,6 +216,39 @@ pub fn entries(dir: &Path) -> Vec<String> {
         }
     }
     path_cmds.sort();
+    // Miss directo: lo no cacheado se pide a brew una vez y se guarda.
+    // (ponytail: cubre installs nuevos sin esperar las 24h del caché.)
+    let missing: Vec<&str> = freq_cmds.iter().chain(path_cmds.iter()).map(|s| s.as_str())
+        .filter(|c| !desc.contains_key(*c)).collect();
+    if !missing.is_empty() {
+        let mut cmd = Command::new("brew");
+        cmd.arg("desc");
+        for m in &missing { cmd.arg(m); }
+        if let Ok(o) = cmd.output() {
+            let text = String::from_utf8_lossy(&o.stdout).into_owned();
+            let mut fresh = vec![];
+            for line in text.lines() {
+                if let Some((k, v)) = line.split_once(':') {
+                    let (k, v) = (trim(k), trim(v.trim_start_matches(' ')));
+                    if !k.is_empty() && !v.is_empty() {
+                        desc.insert(k.to_string(), v.to_string());
+                        fresh.push(line.to_string());
+                    }
+                }
+            }
+            if !fresh.is_empty() {
+                let cache = dir.join("brew-desc.txt");
+                let mut all = fs::read_to_string(&cache).unwrap_or_default();
+                if !all.is_empty() && !all.ends_with('\n') { all.push('\n'); }
+                all.push_str(&fresh.join("\n"));
+                all.push('\n');
+                let _ = fs::write(&cache, all);
+            }
+        }
+    }
+    for cmd in &freq_cmds {
+        out.push(label(cmd, &desc, true));
+    }
     for cmd in path_cmds {
         out.push(label(&cmd, &desc, false));
     }

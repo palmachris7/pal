@@ -92,13 +92,6 @@ fn main() {
         return;
     }
 
-    let fzf = match which("fzf") {
-        Some(p) => p,
-        None => {
-            eprint!("pal_smart: fzf is required");
-            std::process::exit(127);
-        }
-    };
     let herdr_bin = env::var("HERDR_BIN_PATH").unwrap_or("/opt/homebrew/bin/herdr".into());
     if which(&herdr_bin).is_none() && !PathBuf::from(&herdr_bin).exists() {
         eprint!("pal_smart: Herdr binary not found: {}", herdr_bin);
@@ -107,6 +100,13 @@ fn main() {
 
     // Native picker (nucleo+Ratatui) unless PAL_USE_FZF=1 escape hatch.
     let (query, sel): (String, String) = if env::var("PAL_USE_FZF").as_deref() == Ok("1") {
+        let fzf = match which("fzf") {
+            Some(p) => p,
+            None => {
+                eprint!("pal_smart: fzf is required");
+                std::process::exit(127);
+            }
+        };
         fzf_run(&fzf, &entries)
     } else {
         match pick::run(&entries) {
