@@ -104,7 +104,11 @@ pub fn open_cmd(cmd: &str) -> i32 {
         return 1;
     }
 
-    // Pane count in target tab: 1 → split, 2+ → new tab (auto mode).
+    // Pane count in target tab to determine split sequence:
+    // 1 pane → split right (2)
+    // 2 panes → split down (3)
+    // 3 panes → split right (4)
+    // 4+ panes → new tab
     let mut pane_count: usize = 0;
     if !tab_id.is_empty() {
         if let Ok(out) = Command::new(herdr_bin())
@@ -129,24 +133,31 @@ pub fn open_cmd(cmd: &str) -> i32 {
     }
     let mut mode = env::var("PAL_SMART_OPEN").unwrap_or("auto".into());
     if mode == "auto" {
-        mode = if pane_count <= 1 { "split".into() } else { "tab".into() };
+        // Custom sequence: right, down, right, then tabs
+        mode = match pane_count {
+            0 | 1 => "split-right".to_string(),
+            2 => "split-down".to_string(),
+            3 => "split-right".to_string(),
+            _ => "tab".to_string(),
+        };
     }
     if mode.is_empty() {
-        mode = "split".into();
+        mode = "split-right".into();
     }
 
     let mut new_pane = String::new();
-    if mode == "split" && !active_pane.is_empty() {
+    if mode.starts_with("split") && !active_pane.is_empty() {
         let ok = Command::new(herdr_bin())
             .args(["pane", "get", &active_pane])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
         if ok {
+            let direction = if mode == "split-down" { "down" } else { "right" };
             if let Ok(out) = Command::new(herdr_bin())
                 .args([
                     "pane", "split", &active_pane,
-                    "--direction", "right", "--ratio", "0.5", "--focus",
+                    "--direction", direction, "--ratio", "0.5", "--focus",
                 ])
                 .output()
             {
