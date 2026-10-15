@@ -249,8 +249,8 @@ fn remove_before(s: &mut String, pos: usize) -> usize {
     p - 1
 }
 
-/// `?pregunta` / `??idea` → (opencode, texto). None = not a question.
-// TODO: multi-agent config; por ahora todo es opencode.
+/// `?pregunta` / `??idea` → (pi, texto). None = not a question.
+// Agents: pi default; opencode legacy via PAL_AGENT_BIN=opencode.
 fn is_question(q: &str) -> Option<(&'static str, String)> {
     let t = q.trim();
     if let Some(r) = t.strip_prefix("??") {
@@ -401,15 +401,25 @@ fn spawn_answer(
     session: Option<String>,
     tx: std::sync::mpsc::Sender<(u64, AnsEvt)>,
 ) -> Option<Child> {
-    // PAL_OCODE_BIN lets users pin the exact agent binary. Todo opencode por ahora.
-    let _ = agent;
-    let mut cmd = Command::new(std::env::var("PAL_OCODE_BIN").unwrap_or("opencode".into()));
-    // Headless JSONL: one JSON object per line (step_start/text/tool_use/...).
-    // --session continues the conversation within this pal run.
-    if let Some(s) = session {
-        cmd.args(["run", "-s", &s, "--format", "json", prompt]);
+    // Agent binary: PAL_AGENT_BIN wins, PAL_OCODE_BIN legacy, else the agent name.
+    let bin = std::env::var("PAL_AGENT_BIN")
+        .or_else(|_| std::env::var("PAL_OCODE_BIN"))
+        .unwrap_or_else(|_| agent.to_string());
+    let mut cmd = Command::new(bin);
+    if agent == "pi" {
+        // pi headless: plain text out. --continue keeps the conversation.
+        if session.is_some() {
+            cmd.args(["--continue", prompt]);
+        } else {
+            cmd.args(["-p", prompt]);
+        }
     } else {
-        cmd.args(["run", "--format", "json", prompt]);
+        // opencode headless JSONL; --session continues the conversation.
+        if let Some(s) = session {
+            cmd.args(["run", "-s", &s, "--format", "json", prompt]);
+        } else {
+            cmd.args(["run", "--format", "json", prompt]);
+        }
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
     // Own process group so killpg() below only ever hits our subtree.
@@ -558,7 +568,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     let mut ans_active: Option<u64> = None;
     let mut ans_child: Option<Child> = None;
     let mut ans_rx: Option<Receiver<(u64, AnsEvt)>> = None;
-    let mut ans_agent: &'static str = "opencode";
+    let mut ans_agent: &'static str = "pi";
     let mut ans_last_q = String::new();
     let mut ans_session: Option<String> = None;
     let mut ans_shell = false;
@@ -594,7 +604,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             cursor = order.len() - 1;
         }
         // Pump streamed events (ignore stale generations).
-        // Shell lines are raw text; agent lines are opencode JSONL.
+        // Shell + pi lines are raw text; opencode lines are JSONL.
         if let Some(rx) = &ans_rx {
             while let Ok((g, m)) = rx.try_recv() {
                 if Some(g) != ans_active {
@@ -606,6 +616,14 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                             // Drop zshrc init noise (`(eval):1: ...`), keep real output.
                             if !l.starts_with("(eval)") {
                                 ans_lines.push(l);
+                            }
+                        } else if ans_agent == "pi" {
+                            if !l.trim().is_empty() {
+                                ans_lines.push(l);
+                            }
+                            // pi --continue chains turns; mark session alive.
+                            if ans_session.is_none() {
+                                ans_session = Some("pi".into());
                             }
                         } else {
                             let p = parse_json_line(&l);
@@ -1311,9 +1329,9 @@ mod tests {
 
     #[test]
     fn question_detect() {
-        assert_eq!(is_question("?hola").unwrap().0, "opencode");
+        assert_eq!(is_question("?hola").unwrap().0, "pi");
         assert_eq!(is_question("?hola").unwrap().1, "hola");
-        assert_eq!(is_question("??haz x").unwrap().0, "opencode");
+        assert_eq!(is_question("??haz x").unwrap().0, "pi");
         assert!(is_question("?").is_none());
         assert!(is_question("??").is_none());
         assert!(is_question("?  ").is_none());
