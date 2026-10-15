@@ -258,14 +258,14 @@ fn is_question(q: &str) -> Option<(&'static str, String)> {
         if r.is_empty() {
             return None;
         }
-        return Some(("opencode", r.to_string()));
+        return Some(("pi", r.to_string()));
     }
     if let Some(r) = t.strip_prefix('?') {
         let r = r.trim();
         if r.is_empty() {
             return None;
         }
-        return Some(("opencode", r.to_string()));
+        return Some(("pi", r.to_string()));
     }
     None
 }

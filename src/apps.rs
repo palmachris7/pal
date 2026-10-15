@@ -16,7 +16,6 @@ const DEFAULT_APPS: &str = r#"# pal_smart — interactive terminal applications
 # [Agents]
 pi → AI agent de código
 prime-agent → AI agent primario
-opencode → AI coding agent
 
 # [Development]
 nvim → Neovim editor
