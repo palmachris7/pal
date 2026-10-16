@@ -190,8 +190,10 @@ pub fn open_cmd(cmd: &str) -> i32 {
     }
 
     thread::sleep(Duration::from_millis(150));
+    // Self-closing pane: exiting the shell (any app quit) closes the pane.
+    let wrapped = format!("trap 'herdr pane close \"$HERDR_PANE_ID\" 2>/dev/null; exit' EXIT; {}\n", cmd);
     let _ = Command::new(herdr_bin())
-        .args(["pane", "send-text", &new_pane, &format!("{}\n", cmd)])
+        .args(["pane", "send-text", &new_pane, &wrapped])
         .output();
     0
 }
