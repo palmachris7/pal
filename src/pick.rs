@@ -287,21 +287,22 @@ fn remove_before(s: &mut String, pos: usize) -> usize {
 
 /// `?pregunta` / `??idea` → (pi, texto). None = not a question.
 // Agents: pi default; opencode legacy via PAL_AGENT_BIN=opencode.
-fn is_question(q: &str) -> Option<(&'static str, String)> {
+/// `?q` → quick pi answer (no tools), `??q` → full pi agent (tools on).
+fn is_question(q: &str) -> Option<(&'static str, String, bool)> {
     let t = q.trim();
     if let Some(r) = t.strip_prefix("??") {
         let r = r.trim();
         if r.is_empty() {
             return None;
         }
-        return Some(("pi", r.to_string()));
+        return Some(("pi", r.to_string(), true));
     }
     if let Some(r) = t.strip_prefix('?') {
         let r = r.trim();
         if r.is_empty() {
             return None;
         }
-        return Some(("pi", r.to_string()));
+        return Some(("pi", r.to_string(), false));
     }
     None
 }
@@ -433,6 +434,7 @@ fn reset_answer(child: &mut Option<Child>, active: &mut Option<u64>) {
 fn spawn_answer(
     agent: &str,
     prompt: &str,
+    full: bool,
     generation: u64,
     session: Option<String>,
     tx: std::sync::mpsc::Sender<(u64, AnsEvt)>,
@@ -446,6 +448,10 @@ fn spawn_answer(
         // Ephemeral pal sessions: own dir (wiped on pal exit), chaining intact.
         if let Ok(d) = std::env::var("PAL_PI_SESSION_DIR") {
             cmd.args(["--session-dir", &d]);
+        }
+        // ? quick: no tools (pure answer). ?? full: tools on (acts).
+        if !full {
+            cmd.arg("--no-tools");
         }
         // pi headless: plain text out. --continue keeps the conversation.
         if session.is_some() {
@@ -610,6 +616,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     let mut ans_child: Option<Child> = None;
     let mut ans_rx: Option<Receiver<(u64, AnsEvt)>> = None;
     let mut ans_agent: &'static str = "pi";
+    let mut ans_full = false;
     let mut ans_last_q = String::new();
     let mut ans_session: Option<String> = None;
     let mut ans_shell = false;
@@ -734,8 +741,9 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                     ans_lines.push("(no se pudo lanzar el shell)".into());
                 }
             }
-        } else if let Some((agent, prompt)) = is_question(&query) {
+        } else if let Some((agent, prompt, full)) = is_question(&query) {
             ans_agent = agent;
+            ans_full = full;
             ans_shell = false;
             if ans_active.is_none() && query != ans_last_q && last_type.elapsed() > Duration::from_millis(idle_ms) {
                 ans_gen += 1;
@@ -750,7 +758,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 if ans_lines.last().map(|l| l != &qline).unwrap_or(true) {
                     ans_lines.push(qline);
                 }
-                ans_child = spawn_answer(agent, &prompt, ans_gen, ans_session.clone(), tx);
+                ans_child = spawn_answer(agent, &prompt, full, ans_gen, ans_session.clone(), tx);
                 if ans_child.is_none() {
                     ans_active = None;
                     ans_lines.push("(no se pudo lanzar el agente)".into());
@@ -868,7 +876,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                         }
                     }
                 } else if ans_active.is_some() {
-                    format!("   {} {} está respondiendo… (Enter copia y sale, Esc cierra)", SPIN[spin % SPIN.len()], ans_agent)
+                    let who = if ans_full { "pi⁺" } else { "pi" };
+                    format!("   {} {} está respondiendo… (Enter copia y sale, Esc cierra)", SPIN[spin % SPIN.len()], who)
                 } else {
                     format!("   ✦ respuesta de {} (Enter copia y sale, Esc cierra)", ans_agent)
                 }
@@ -1393,7 +1402,9 @@ mod tests {
     fn question_detect() {
         assert_eq!(is_question("?hola").unwrap().0, "pi");
         assert_eq!(is_question("?hola").unwrap().1, "hola");
+        assert!(!is_question("?hola").unwrap().2);
         assert_eq!(is_question("??haz x").unwrap().0, "pi");
+        assert!(is_question("??haz x").unwrap().2);
         assert!(is_question("?").is_none());
         assert!(is_question("??").is_none());
         assert!(is_question("?  ").is_none());
