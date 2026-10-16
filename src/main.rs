@@ -143,7 +143,7 @@ fn main() {
     }
 
     // Native picker (nucleo+Ratatui) unless PAL_USE_FZF=1 escape hatch.
-    let (query, sel): (String, String) = if env::var("PAL_USE_FZF").as_deref() == Ok("1") {
+    let (query, sel, _force): (String, String, bool) = if env::var("PAL_USE_FZF").as_deref() == Ok("1") {
         let fzf = match which("fzf") {
             Some(p) => p,
             None => {
@@ -151,10 +151,28 @@ fn main() {
                 std::process::exit(127);
             }
         };
-        fzf_run(&fzf, &entries)
+        let (q, s) = fzf_run(&fzf, &entries);
+        (q, s, false)
     } else {
-        match pick::run(&entries) {
-            Some((q, s)) => (q, s.unwrap_or_default()),
+        // Live apps (●): Enter focuses, ⌘↵/⌥↵ forces new window.
+        let live = herdr::running();
+        let running: std::collections::HashSet<String> = live.keys().cloned().collect();
+        match pick::run(&entries, &running) {
+            Some((q, s, force)) => {
+                let sel = s.unwrap_or_default();
+                if !force && !sel.is_empty() {
+                    let after = sel.split('|').nth(1).unwrap_or("");
+                    let cmd0 = after.split('→').next().unwrap_or("").trim();
+                    let base = cmd0.split_whitespace().next().unwrap_or("");
+                    let base = base.rsplit('/').next().unwrap_or("").to_lowercase();
+                    if let Some(pid) = live.get(&base) {
+                        herdr::pane_focus(pid);
+                        herdr::popup_close();
+                        return;
+                    }
+                }
+                (q, sel, force)
+            }
             None => return, // Esc: silent exit like fzf
         }
     };

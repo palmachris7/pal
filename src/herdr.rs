@@ -221,18 +221,74 @@ pub fn spawn_detached_open(cmd: &str, ws: &str, pane: &str, tab: &str, mode: &st
 }
 
 /// Native popup.close over the Herdr socket (1s timeout).
-pub fn popup_close() {
-    let path = sock_path();
-    let Ok(mut s) = UnixStream::connect(path) else {
-        return;
+fn sock_send(id: &str, method: &str, params: &str) -> Option<Value> {
+    let Ok(mut s) = UnixStream::connect(sock_path()) else {
+        return None;
     };
     let _ = s.set_read_timeout(Some(Duration::from_secs(1)));
     let _ = s.set_write_timeout(Some(Duration::from_secs(1)));
-    let msg = r#"{"id":"pal-smart:popup-close","method":"popup.close","params":{}}"#.to_string() + "\n";
-    if s.write_all(msg.as_bytes()).is_err() {
-        return;
-    }
-    let mut buf = [0u8; 4096];
+    let msg = format!(r#"{{"id":"{id}","method":"{method}","params":{params}}}"#) + "\n";
+    s.write_all(msg.as_bytes()).ok()?;
+    let mut buf = [0u8; 8192];
     use std::io::Read;
-    let _ = s.read(&mut buf);
+    s.read(&mut buf).ok()?;
+    serde_json::from_slice::<Value>(&buf).ok()
+}
+
+pub fn popup_close() {
+    sock_send("pal-smart:popup-close", "popup.close", "{}");
+}
+
+/// Focus a pane by id (socket pane.focus).
+pub fn pane_focus(pane_id: &str) {
+    let params = format!(r#"{{"pane_id":"{pane_id}"}}"#);
+    sock_send("pal-smart:pane-focus", "pane.focus", &params);
+}
+
+/// Live app basename → pane_id, via pane list + process-info per pane.
+pub fn running() -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(list) = Command::new(herdr_bin()).args(["pane", "list"]).output() else {
+        return out;
+    };
+    let Ok(v) = serde_json::from_slice::<Value>(&list.stdout) else {
+        return out;
+    };
+    let core = snap_core(v);
+    let arr = core
+        .get("result")
+        .and_then(|r| r.get("panes"))
+        .or_else(|| core.get("panes"))
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for p in &arr {
+        let pid = str_at(p, &["pane_id"]);
+        if pid.is_empty() {
+            continue;
+        }
+        let Ok(info) = Command::new(herdr_bin()).args(["pane", "process-info", "--pane", &pid]).output() else {
+            continue;
+        };
+        let Ok(iv) = serde_json::from_slice::<Value>(&info.stdout) else {
+            continue;
+        };
+        let core = snap_core(iv);
+        let fg = core
+            .get("result")
+            .and_then(|r| r.get("process_info"))
+            .and_then(|i| i.get("foreground_processes"))
+            .and_then(|f| f.as_array())
+            .and_then(|f| f.first());
+        let name = fg
+            .map(|f| str_at(f, &["argv0"]))
+            .filter(|s| !s.is_empty())
+            .or_else(|| fg.map(|f| str_at(f, &["name"])).filter(|s| !s.is_empty()))
+            .unwrap_or_default();
+        let base = name.rsplit('/').next().unwrap_or("").to_lowercase();
+        if !base.is_empty() && base != "sh" && base != "zsh" && base != "bash" && base != "fish" {
+            out.entry(base).or_insert(pid);
+        }
+    }
+    out
 }

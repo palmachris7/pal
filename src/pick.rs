@@ -583,8 +583,17 @@ fn match_indices(entry: &str, pat: &Pattern) -> Vec<u32> {
         .collect()
 }
 
-/// Run the picker. Returns (query, selection?) or None on abort.
-pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
+/// Basename of the command in an entry ("TAG | cmd → desc" → "cmd").
+fn entry_cmd(entry: &str) -> String {
+    let after = entry.split('|').nth(1).unwrap_or("");
+    let cmd = after.split('→').next().unwrap_or("").trim();
+    let first = cmd.split_whitespace().next().unwrap_or("");
+    first.rsplit('/').next().unwrap_or("").to_lowercase()
+}
+
+/// Run the picker. Returns (query, selection?, force_new_window?) or None.
+/// `running` = set of app basenames with a live pane (shown with ●).
+pub fn run(entries: &[String], running: &std::collections::HashSet<String>) -> Option<(String, Option<String>, bool)> {
     let mut term =
         Terminal::new(CrosstermBackend::new(std::io::BufWriter::new(io::stderr()))).ok()?;
     crossterm::terminal::enable_raw_mode().ok()?;
@@ -953,7 +962,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                         Style::default().fg(FG)
                     };
                     let (text, _) = display_span(&entries[ei]);
-                    let fitted = fit(&text, content_w.saturating_sub(4));
+                    let dot = if running.contains(&entry_cmd(&entries[ei])) { " ●" } else { "" };
+                    let fitted = format!("{}{}", fit(&text, content_w.saturating_sub(4)), dot);
                     if selected || pat.is_none() {
                         ListItem::new(Line::from(vec![
                             Span::raw(" "),
@@ -1109,7 +1119,9 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 journal.line("exit ctrlc".into());
                 return None;
             }
-            (KeyCode::Enter, _) => {
+            (KeyCode::Enter, mods) => {
+                // ⌘↵ / ⌥↵ = force new window even if the app is running.
+                let force_new = mods.contains(KeyModifiers::SUPER) || mods.contains(KeyModifiers::ALT);
                 if in_ask || answering {
                     // Idempotente: con respuesta → copiar y salir.
                     // Pensando → quedarse quieto (no matar, no relanzar).
@@ -1119,7 +1131,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                         kill_answer(&mut ans_child);
                         copy_answer(&la);
                         journal.line("exit enter-copy".into());
-                        return Some((String::new(), None));
+                        return Some((String::new(), None, false));
                     }
                     if ans_active.is_none() {
                         ans_last_q = String::new();
@@ -1128,7 +1140,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 } else {
                     let sel = order.get(cursor).map(|&i| entries[i].clone());
                     journal.line(format!("exit enter sel={}", sel.is_some() as u8));
-                    return Some((query, sel));
+                    return Some((query, sel, force_new));
                 }
             }
             (KeyCode::Backspace, _) => {
@@ -1243,7 +1255,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                                     kill_answer(&mut ans_child);
                                     let sel = order.get(target).map(|&i| entries[i].clone());
                                     journal.line(format!("exit dblclick sel={}", sel.is_some() as u8));
-                                    return Some((query, sel));
+                                    return Some((query, sel, false));
                                 }
                                 cursor = target;
                                 last_click = Some((target, now));
