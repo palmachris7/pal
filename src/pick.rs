@@ -847,16 +847,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             } else {
                 (None, rows[2])
             };
-            let cwd_short = std::env::var("PAL_CWD")
-                .or_else(|_| std::env::current_dir().map(|p| p.display().to_string()))
-                .unwrap_or_default();
-            let home = std::env::var("HOME").unwrap_or_default();
-            let cwd_short = if !home.is_empty() && cwd_short.starts_with(&home) {
-                format!("~{}", &cwd_short[home.len()..])
-            } else {
-                cwd_short
-            };
-            let prompt_line = format!("   {} ⚡ {}", cwd_short, query);
+            let prompt_line = format!("   ⚡ {}", query);
             // Solo N/M visible (Raycast-style). El resto vive en el journal.
             let status_line = format!("  {}/{}", order.len(), entries.len());
             f.render_widget(
