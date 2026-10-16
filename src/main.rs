@@ -80,6 +80,16 @@ fn main() {
 
     let dir = config_dir();
     let _ = fs::create_dir_all(&dir);
+    // Ephemeral pi sessions for ? answers: own --session-dir, wiped on exit.
+    struct PiTmp(std::path::PathBuf);
+    impl Drop for PiTmp {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+    let pi_tmp = std::env::temp_dir().join(format!("pal-pi-{}", std::process::id()));
+    let _ = fs::create_dir_all(&pi_tmp);
+    // SAFETY: single-threaded at startup, before any threads spawn.
+    unsafe { env::set_var("PAL_PI_SESSION_DIR", &pi_tmp) };
+    let _pi_tmp_guard = PiTmp(pi_tmp);
     let entries = apps::entries(&dir);
 
     if args.first().map(|s| s.as_str()) == Some("--list") {

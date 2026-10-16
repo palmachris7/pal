@@ -407,6 +407,10 @@ fn spawn_answer(
         .unwrap_or_else(|_| agent.to_string());
     let mut cmd = Command::new(bin);
     if agent == "pi" {
+        // Ephemeral pal sessions: own dir (wiped on pal exit), chaining intact.
+        if let Ok(d) = std::env::var("PAL_PI_SESSION_DIR") {
+            cmd.args(["--session-dir", &d]);
+        }
         // pi headless: plain text out. --continue keeps the conversation.
         if session.is_some() {
             cmd.args(["--continue", prompt]);
