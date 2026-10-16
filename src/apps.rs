@@ -275,27 +275,56 @@ fn schedule_missing_brew_descs(dir: &Path, freq: &[String], path: &[String], exi
     let cache_arc = Arc::new(cache);
 
     thread::spawn(move || {
+        // `brew desc` aborta al primer nombre desconocido, asi que no se le
+        // puede pasar binarios de PATH. Via leaves: formula -> desc, y
+        // `brew list <formula>` mapea binarios (hx) a su formula (helix).
+        let missing_set: std::collections::HashSet<&str> =
+            missing_arc.iter().map(|s| s.as_str()).collect();
+        let leaves_out = Command::new("brew").arg("leaves").output();
+        let Ok(leaves_out) = leaves_out else { return; };
+        let leaves_txt = String::from_utf8_lossy(&leaves_out.stdout).into_owned();
+        let leaves: Vec<&str> = leaves_txt.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        if leaves.is_empty() { return; }
         let mut cmd = Command::new("brew");
         cmd.arg("desc");
-        for m in missing_arc.iter() { cmd.arg(m); }
-        if let Ok(o) = cmd.output() {
-            let text = String::from_utf8_lossy(&o.stdout).into_owned();
-            let mut fresh = vec![];
-            for line in text.lines() {
-                if let Some((k, v)) = line.split_once(':') {
-                    let (k, v) = (trim(k), trim(v.trim_start_matches(' ')));
-                    if !k.is_empty() && !v.is_empty() {
-                        fresh.push(line.to_string());
-                    }
-                }
+        for l in &leaves { cmd.arg(l); }
+        let Ok(o) = cmd.output() else { return; };
+        let desc_txt = String::from_utf8_lossy(&o.stdout).into_owned();
+        let mut descs = std::collections::HashMap::new();
+        for line in desc_txt.lines() {
+            if let Some((k, v)) = line.split_once(':') {
+                let (k, v) = (trim(k), trim(v.trim_start_matches(' ')));
+                if !k.is_empty() && !v.is_empty() { descs.insert(k, v); }
             }
-            if !fresh.is_empty() {
-                let mut all = fs::read_to_string(&*cache_arc).unwrap_or_default();
-                if !all.is_empty() && !all.ends_with('\n') { all.push('\n'); }
-                all.push_str(&fresh.join("\n"));
-                all.push('\n');
-                let _ = fs::write(&*cache_arc, all);
-            }
+        }
+        // Un solo `brew list`: Cellar/<formula>/<ver>/bin/<name> (~1s).
+        let mut list_cmd = Command::new("brew");
+        list_cmd.arg("list");
+        for l in &leaves { list_cmd.arg(l); }
+        let Ok(lo) = list_cmd.output() else { return; };
+        let have = fs::read_to_string(&*cache_arc).unwrap_or_default();
+        let mut fresh: Vec<String> = vec![];
+        let mut seen = std::collections::HashSet::new();
+        let list_txt = String::from_utf8_lossy(&lo.stdout).into_owned();
+        for line in list_txt.lines() {
+            // .../Cellar/<formula>/<ver>/bin/<name>
+            let mut seg: Vec<&str> = line.split("/bin/").collect();
+            if seg.len() != 2 { continue; }
+            let name = seg[1].trim();
+            let parts: Vec<&str> = seg[0].split('/').collect();
+            let (Some(formula), name_ok) = (parts.iter().rev().nth(1).copied(), !name.is_empty() && !name.contains('/')) else { continue };
+            if !name_ok { continue; }
+            let Some(d) = descs.get(formula) else { continue };
+            if !missing_set.contains(name) || !seen.insert(name.to_string()) { continue; }
+            if have.lines().any(|e| e.starts_with(&format!("{}:", name))) { continue; }
+            fresh.push(format!("{}: {}", name, d));
+        }
+        if !fresh.is_empty() {
+            let mut all = have;
+            if !all.is_empty() && !all.ends_with('\n') { all.push('\n'); }
+            all.push_str(&fresh.join("\n"));
+            all.push('\n');
+            let _ = fs::write(&*cache_arc, all);
         }
     });
 }
