@@ -190,8 +190,10 @@ pub fn open_cmd(cmd: &str) -> i32 {
     }
 
     thread::sleep(Duration::from_millis(150));
-    // Self-closing pane: when the app exits, close the pane right away.
-    let wrapped = format!("{0}; herdr pane close \"$HERDR_PANE_ID\" 2>/dev/null; exit\n", cmd);
+    // Self-closing pane: long TUIs close on exit. Quick one-shots (<2s,
+    // PAL_HOLD_SECS) or failures hold silently until q / esc / enter.
+    // Key wait runs under /bin/bash: zsh `read` has no -n flag.
+    let wrapped = format!("t0=$(date +%s); {{ {0}; }}; c=$?; t1=$(date +%s); hold=${{PAL_HOLD_SECS:-2}}; if [ $c -ne 0 ] || [ $((t1 - t0)) -lt $hold ]; then /bin/bash -c 'e=$(printf \"\\033\"); while true; do IFS= read -rsn1 k; case \"$k\" in q|\"$e\"|\"\") break;; esac; done'; fi; herdr pane close \"$HERDR_PANE_ID\" 2>/dev/null; exit\n", cmd);
     let _ = Command::new(herdr_bin())
         .args(["pane", "send-text", &new_pane, &wrapped])
         .output();
