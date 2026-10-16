@@ -709,12 +709,13 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 }
             }
         }
-        // Launch agent/shell after 600ms idle. ans_last_q prevents
-        // relaunching after Done for the same text. New turns APPEND
-        // a ❯ block to the transcript (conversation, never cleared).
+        // Launch agent/shell after idle (default 1200ms, PAL_DEBOUNCE_MS
+        // overrides). ans_last_q prevents relaunching after Done for the
+        // same text. New turns APPEND a ❯ block (never cleared).
+        let idle_ms: u64 = std::env::var("PAL_DEBOUNCE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1200);
         if let Some(prompt) = is_shell(&query) {
             ans_shell = true;
-            if ans_active.is_none() && query != ans_last_q && last_type.elapsed() > Duration::from_millis(600) {
+            if ans_active.is_none() && query != ans_last_q && last_type.elapsed() > Duration::from_millis(idle_ms) {
                 ans_gen += 1;
                 let (tx, rx) = mpsc::channel();
                 ans_rx = Some(rx);
@@ -736,7 +737,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
         } else if let Some((agent, prompt)) = is_question(&query) {
             ans_agent = agent;
             ans_shell = false;
-            if ans_active.is_none() && query != ans_last_q && last_type.elapsed() > Duration::from_millis(600) {
+            if ans_active.is_none() && query != ans_last_q && last_type.elapsed() > Duration::from_millis(idle_ms) {
                 ans_gen += 1;
                 let (tx, rx) = mpsc::channel();
                 ans_rx = Some(rx);
