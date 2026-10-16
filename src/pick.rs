@@ -73,6 +73,42 @@ fn fit(s: &str, max_w: usize) -> String {
     out
 }
 
+/// Word-wrap a line into width-fitting chunks (no truncation, no loss).
+/// Long answer lines flow to the row below instead of ending in ….
+fn wrap_line(s: &str, max_w: usize) -> Vec<String> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let max_w = max_w.max(1);
+    if gwidth(s) <= max_w {
+        return vec![s.to_string()];
+    }
+    let mut rows: Vec<String> = vec![];
+    let mut cur = String::new();
+    let mut cur_w = 0;
+    // Flush current row, trying to break at the last space.
+    let mut flush = |cur: &mut String, cur_w: &mut usize, rows: &mut Vec<String>| {
+        if let Some(i) = cur.rfind(' ') {
+            let tail = cur[i + 1..].to_string();
+            cur.truncate(i);
+            rows.push(std::mem::take(cur));
+            *cur = tail;
+            *cur_w = gwidth(cur.as_str());
+        } else {
+            rows.push(std::mem::take(cur));
+            *cur_w = 0;
+        }
+    };
+    for g in s.graphemes(true) {
+        let cw = gwidth(g);
+        if cur_w + cw > max_w && !cur.is_empty() {
+            flush(&mut cur, &mut cur_w, &mut rows);
+        }
+        cur.push_str(g);
+        cur_w += cw;
+    }
+    rows.push(cur);
+    rows
+}
+
 /// (display_text, GRAPHEME offset_of_display_within_entry).
 /// Offsets are grapheme counts: nucleo reports grapheme indices.
 fn display_span(entry: &str) -> (String, usize) {
@@ -568,6 +604,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
     // Inline answer state (? / ?? questions).
     let mut ans_lines: Vec<String> = vec![];
     let mut ans_scroll: usize = 0;
+    let mut ans_wmax: usize = 0; // wrapped-row scroll max, set each draw
     let mut ans_gen: u64 = 0;
     let mut ans_active: Option<u64> = None;
     let mut ans_child: Option<Child> = None;
@@ -741,14 +778,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             offset = cursor + 1 - view_h;
         }
         journal.state(cursor, offset, order.len(), view_h, query.len(), answering, ev_count);
-        // Answer scroll: clamp every frame (resize-safe) + tail-follow.
-        let ans_max = ans_lines.len().saturating_sub(view_h);
-        if ans_scroll > ans_max {
-            ans_scroll = ans_max;
-        }
-        if answering && ans_pinned {
-            ans_scroll = ans_max;
-        }
+        // Answer scroll clamp + tail-follow happen inside draw (wrapped rows).
         if ans_active.is_some() {
             spin += 1;
         }
@@ -861,20 +891,36 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             );
             let content_w = (list_row.width as usize).saturating_sub(1);
             let items: Vec<ListItem> = if answering {
-                ans_lines
+                // Wrap long lines to the row below (no … truncation, no loss).
+                let ww = content_w.saturating_sub(2);
+                let mut wrapped: Vec<(bool, String)> = vec![];
+                for l in ans_lines.iter() {
+                    let user = l.starts_with(QBLOCK);
+                    for c in wrap_line(l, ww) {
+                        wrapped.push((user, c));
+                    }
+                }
+                let wmax = wrapped.len().saturating_sub(drawn_h);
+                ans_wmax = wmax;
+                if ans_scroll > wmax {
+                    ans_scroll = wmax;
+                }
+                if ans_pinned {
+                    ans_scroll = wmax;
+                }
+                wrapped
                     .iter()
                     .skip(ans_scroll)
                     .take(drawn_h)
-                    .map(|l| {
-                        let fitted = fit(l, content_w.saturating_sub(2));
-                        if fitted.starts_with(QBLOCK) {
+                    .map(|(user, c)| {
+                        if *user {
                             // User turn: accent voice, stands out in history.
                             ListItem::new(Line::from(vec![Span::styled(
-                                format!("  {}", fitted),
+                                format!("  {}", c),
                                 Style::default().fg(MARK).add_modifier(Modifier::BOLD),
                             )]))
                         } else {
-                            ListItem::new(Line::from(md_spans(&fitted, Style::default().fg(FG))))
+                            ListItem::new(Line::from(md_spans(c, Style::default().fg(FG))))
                         }
                     })
                     .collect()
@@ -922,8 +968,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             };
             f.render_widget(List::new(items), list_row);
             // Scrollbar (fzf style): dim track + bright thumb on last column.
-            // In answer mode it follows ans_scroll over the answer lines.
-            let (sb_total, sb_off) = if answering { (ans_lines.len(), ans_scroll) } else { (order.len(), offset) };
+            // In answer mode it follows ans_scroll over the wrapped rows.
+            let (sb_total, sb_off) = if answering { (ans_wmax + drawn_h, ans_scroll) } else { (order.len(), offset) };
             if sb_total > drawn_h {
                 let list_area = list_row;
                 let sx = list_area.right().saturating_sub(1);
@@ -1095,9 +1141,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             }
             (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                 if answering {
-                    let max_s = ans_lines.len().saturating_sub(view_h);
-                    ans_scroll = (ans_scroll + 1).min(max_s);
-                    ans_pinned = ans_scroll == max_s;
+                    ans_scroll = (ans_scroll + 1).min(ans_wmax);
+                    ans_pinned = ans_scroll == ans_wmax;
                 } else if cursor + 1 < order.len() {
                     cursor += 1;
                 }
@@ -1130,9 +1175,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
             Event::Mouse(m) => {
                 ev_count += 1;
                 let max_cur = order.len().saturating_sub(1);
-                // Answer mode scrolls ans_lines with the same scrollbar math.
-                let (sb_total, sb_off) = if answering { (ans_lines.len(), ans_scroll) } else { (order.len(), offset) };
-                let set_ans_scroll = |v: usize, view_h: usize, len: usize| v.min(len.saturating_sub(view_h));
+                // Answer mode scrolls wrapped rows with the same scrollbar math.
+                let (sb_total, sb_off) = if answering { (ans_wmax + view_h, ans_scroll) } else { (order.len(), offset) };
                 match m.kind {
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                         // wheel_acc comes from burst coalescing above:
@@ -1142,9 +1186,9 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                             if m.kind == MouseEventKind::ScrollUp {
                                 ans_scroll = ans_scroll.saturating_sub(step);
                             } else {
-                                ans_scroll = set_ans_scroll(ans_scroll + step, view_h, ans_lines.len());
+                                ans_scroll = (ans_scroll + step).min(ans_wmax);
                             }
-                            ans_pinned = ans_scroll == ans_lines.len().saturating_sub(view_h);
+                            ans_pinned = ans_scroll == ans_wmax;
                         } else if m.kind == MouseEventKind::ScrollUp {
                             cursor = cursor.saturating_sub(step);
                         } else {
@@ -1179,8 +1223,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                         } else if row >= list_y && row < list_y + view_h && !order.is_empty() {
                             if answering {
                                 let r = row - list_y;
-                                ans_scroll = set_ans_scroll(r * sb_total / view_h, view_h, sb_total);
-                                ans_pinned = ans_scroll == ans_lines.len().saturating_sub(view_h);
+                                ans_scroll = (r * sb_total / view_h).min(ans_wmax);
+                                ans_pinned = ans_scroll == ans_wmax;
                             } else {
                                 let target = (offset + row - list_y).min(max_cur);
                                 // Double-click opens (fzf parity): same row twice fast.
@@ -1214,8 +1258,8 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                         } else if (m.row as usize) >= list_y && (m.row as usize) < list_y + view_h {
                             if answering {
                                 let r = (m.row as usize) - list_y;
-                                ans_scroll = set_ans_scroll(r * sb_total / view_h, view_h, sb_total);
-                                ans_pinned = ans_scroll == ans_lines.len().saturating_sub(view_h);
+                                ans_scroll = (r * sb_total / view_h).min(ans_wmax);
+                                ans_pinned = ans_scroll == ans_wmax;
                             } else {
                                 cursor = (offset + (m.row as usize) - list_y).min(max_cur);
                             }
@@ -1302,6 +1346,19 @@ mod tests {
         assert_eq!(display_span("plain"), ("plain".into(), 0));
     }
 
+    #[test]
+    fn wrap_flows_to_next_row() {
+        let rows = super::wrap_line("hola mundo cruel", 7);
+        assert_eq!(rows, vec!["hola".to_string(), "mundo".to_string(), "cruel".to_string()]);
+        // Short lines untouched, hard cut when no spaces.
+        assert_eq!(super::wrap_line("abc", 10), vec!["abc".to_string()]);
+        assert_eq!(super::wrap_line("abcdefgh", 3), vec!["abc".to_string(), "def".to_string(), "gh".to_string()]);
+        // Nothing lost: concat of chunks (sans break spaces) covers input words.
+        let long = "esta es una oracion muy larga que debe fluir abajo sin perderse";
+        let w: Vec<String> = super::wrap_line(long, 20);
+        assert!(w.len() > 1);
+        assert!(w.iter().all(|r| super::gwidth(r) <= 20));
+    }
     #[test]
     fn fit_truncates_by_width() {
         assert_eq!(fit("hola", 10), "hola");
