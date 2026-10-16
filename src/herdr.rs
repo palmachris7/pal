@@ -274,20 +274,22 @@ pub fn running() -> std::collections::HashMap<String, String> {
             continue;
         };
         let core = snap_core(iv);
+        // All foreground processes: wrappers (perl/sh) often lead, app follows.
         let fg = core
             .get("result")
             .and_then(|r| r.get("process_info"))
             .and_then(|i| i.get("foreground_processes"))
             .and_then(|f| f.as_array())
-            .and_then(|f| f.first());
-        let name = fg
-            .map(|f| str_at(f, &["argv0"]))
-            .filter(|s| !s.is_empty())
-            .or_else(|| fg.map(|f| str_at(f, &["name"])).filter(|s| !s.is_empty()))
+            .cloned()
             .unwrap_or_default();
-        let base = name.rsplit('/').next().unwrap_or("").to_lowercase();
-        if !base.is_empty() && base != "sh" && base != "zsh" && base != "bash" && base != "fish" {
-            out.entry(base).or_insert(pid);
+        for f in &fg {
+            let name = str_at(f, &["argv0"]);
+            let name = if name.is_empty() { str_at(f, &["name"]) } else { name };
+            let base = name.rsplit('/').next().unwrap_or("").to_lowercase();
+            if base.is_empty() || base == "sh" || base == "zsh" || base == "bash" || base == "fish" {
+                continue;
+            }
+            out.entry(base).or_insert_with(|| pid.clone());
         }
     }
     out
