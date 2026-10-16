@@ -738,7 +738,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 ans_child = spawn_shell(&prompt, ans_gen, tx);
                 if ans_child.is_none() {
                     ans_active = None;
-                    ans_lines.push("(no se pudo lanzar el shell)".into());
+                    ans_lines.push("(could not launch shell)".into());
                 }
             }
         } else if let Some((agent, prompt, full)) = is_question(&query) {
@@ -761,7 +761,7 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 ans_child = spawn_answer(agent, &prompt, full, ans_gen, ans_session.clone(), tx);
                 if ans_child.is_none() {
                     ans_active = None;
-                    ans_lines.push("(no se pudo lanzar el agente)".into());
+                    ans_lines.push("(could not launch agent)".into());
                 }
             }
         }
@@ -863,26 +863,26 @@ pub fn run(entries: &[String]) -> Option<(String, Option<String>)> {
                 rows[1],
             );
             let header_txt = if !focused && !answering {
-                "   ◌ sin foco — clic en el popup para enfocar".into()
+                "   ◌ unfocused — click the popup to focus".into()
             } else if answering {
                 if ans_shell {
                     if ans_active.is_some() {
-                        format!("   {} ⚙ corriendo… (Enter copia y sale, Esc mata)", SPIN[spin % SPIN.len()])
+                        format!("   {} ⚙ running… (Enter copies & exits, Esc kills)", SPIN[spin % SPIN.len()])
                     } else {
                         match ans_exit {
-                            Some(0) => "   ✔ exit 0 — Enter copia y sale, Esc cierra".into(),
-                            Some(c) => format!("   ✘ exit {} — Enter copia y sale, Esc cierra", c),
-                            None => "   ⚙ terminado — Enter copia y sale, Esc cierra".into(),
+                            Some(0) => "   ✔ exit 0 — Enter copies & exits, Esc closes".into(),
+                            Some(c) => format!("   ✘ exit {} — Enter copies & exits, Esc closes", c),
+                            None => "   ⚙ done — Enter copies & exits, Esc closes".into(),
                         }
                     }
                 } else if ans_active.is_some() {
                     let who = if ans_full { "pi⁺" } else { "pi" };
-                    format!("   {} {} está respondiendo… (Enter copia y sale, Esc cierra)", SPIN[spin % SPIN.len()], who)
+                    format!("   {} {} is answering… (Enter copies & exits, Esc closes)", SPIN[spin % SPIN.len()], who)
                 } else {
-                    format!("   ✦ respuesta de {} (Enter copia y sale, Esc cierra)", ans_agent)
+                    format!("   ✦ answer from {} (Enter copies & exits, Esc closes)", ans_agent)
                 }
             } else {
-                "   Escribe para buscar o ejecutar (Enter = correr lo escrito)".into()
+                "   Type to search or run (Enter = run what you typed)".into()
             };
             if let Some(hr) = header_row {
                 f.render_widget(

@@ -32,7 +32,7 @@ fn fzf_run(fzf: &str, entries: &[String]) -> (String, String) {
             "--border=rounded",
             "--info=hidden",
             "--prompt=  ⚡ ",
-            "--header=Escribe para buscar o ejecutar (Enter = correr lo escrito)",
+            "--header=Type to search or run (Enter = run what you typed)",
             "--scheme=history",
             "--print-query",
             "--delimiter=|",
