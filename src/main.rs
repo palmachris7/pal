@@ -15,6 +15,33 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+/// Cwd del pane herdr activo (no el popup propio): PAL_CWD manda,
+/// luego pane enfocado, luego cwd heredado. Nunca falla: fallback abajo.
+fn active_cwd() -> Option<String> {
+    if let Ok(d) = env::var("PAL_CWD") {
+        if !d.trim().is_empty() {
+            return Some(d);
+        }
+    }
+    env::var("HERDR_SOCKET_PATH").ok()?;
+    let bin = env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
+    let own = env::var("HERDR_PANE_ID").ok().unwrap_or_default();
+    let out = Command::new(bin).args(["pane", "list"]).output().ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let panes = v.pointer("/result/panes")?.as_array()?;
+    let pick = |focused_only: bool| {
+        panes.iter().find(|p| {
+            p.pointer("/pane_id").and_then(|i| i.as_str()) != Some(own.as_str())
+                && (!focused_only || p.pointer("/focused").and_then(|f| f.as_bool()).unwrap_or(false))
+        })
+    };
+    let p = pick(true).or_else(|| pick(false))?;
+    p.pointer("/foreground_cwd")
+        .or_else(|| p.pointer("/cwd"))
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
+}
+
 fn config_dir() -> PathBuf {
     let base = env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -90,6 +117,13 @@ fn main() {
     // SAFETY: single-threaded at startup, before any threads spawn.
     unsafe { env::set_var("PAL_PI_SESSION_DIR", &pi_tmp) };
     let _pi_tmp_guard = PiTmp(pi_tmp);
+    // Sitúate en el proyecto activo (pane herdr) para que ?/?? hereden cwd.
+    if let Some(d) = active_cwd() {
+        if std::env::set_current_dir(&d).is_ok() {
+            // SAFETY: single-threaded at startup, before any threads spawn.
+            unsafe { env::set_var("PAL_CWD", d) };
+        }
+    }
     let entries = apps::entries(&dir);
 
     if args.first().map(|s| s.as_str()) == Some("--list") {
