@@ -104,6 +104,9 @@ pub fn open_cmd(cmd: &str) -> i32 {
         return 1;
     }
 
+    // Wrapper travels via --env (no echo, no files); only a short eval is typed.
+    // Key wait runs under /bin/bash: zsh `read` has no -n flag.
+    let wrapped = format!("t0=$(date +%s); {{ {0}; }}; c=$?; t1=$(date +%s); hold=${{PAL_HOLD_SECS:-2}}; if [ $c -ne 0 ] || [ $((t1 - t0)) -lt $hold ]; then /bin/bash -c 'e=$(printf \"\\033\"); while true; do IFS= read -rsn1 k; case \"$k\" in q|\"$e\"|\"\") break;; esac; done'; fi; herdr pane close \"$HERDR_PANE_ID\" 2>/dev/null; exit", cmd);
     // Pane count in target tab to determine split sequence:
     // 1 pane → split right (2)
     // 2 panes → split down (3)
@@ -158,6 +161,7 @@ pub fn open_cmd(cmd: &str) -> i32 {
                 .args([
                     "pane", "split", &active_pane,
                     "--direction", direction, "--ratio", "0.5", "--focus",
+                    "--env", &format!("PAL_RUN={wrapped}"),
                 ])
                 .output()
             {
@@ -173,7 +177,8 @@ pub fn open_cmd(cmd: &str) -> i32 {
     }
     if new_pane.is_empty() {
         if let Ok(out) = Command::new(herdr_bin())
-            .args(["tab", "create", "--workspace", &target_ws, "--label", cmd, "--focus"])
+            .args(["tab", "create", "--workspace", &target_ws, "--label", cmd, "--focus",
+                "--env", &format!("PAL_RUN={wrapped}")])
             .output()
         {
             if let Ok(v) = serde_json::from_slice::<Value>(&out.stdout) {
@@ -190,12 +195,9 @@ pub fn open_cmd(cmd: &str) -> i32 {
     }
 
     thread::sleep(Duration::from_millis(150));
-    // Self-closing pane: long TUIs close on exit. Quick one-shots (<2s,
-    // PAL_HOLD_SECS) or failures hold silently until q / esc / enter.
-    // Key wait runs under /bin/bash: zsh `read` has no -n flag.
-    let wrapped = format!("t0=$(date +%s); {{ {0}; }}; c=$?; t1=$(date +%s); hold=${{PAL_HOLD_SECS:-2}}; if [ $c -ne 0 ] || [ $((t1 - t0)) -lt $hold ]; then /bin/bash -c 'e=$(printf \"\\033\"); while true; do IFS= read -rsn1 k; case \"$k\" in q|\"$e\"|\"\") break;; esac; done'; fi; herdr pane close \"$HERDR_PANE_ID\" 2>/dev/null; exit\n", cmd);
+    // Only a short eval is typed; the wrapper itself came via --env.
     let _ = Command::new(herdr_bin())
-        .args(["pane", "send-text", &new_pane, &wrapped])
+        .args(["pane", "send-text", &new_pane, "eval \"$PAL_RUN\"\n"])
         .output();
     0
 }
